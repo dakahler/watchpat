@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+package watchpat;
+
+// Reverse-engineered schema for WatchPAT ONE dump payloads.
+//
+// Scope:
+// - Captures the confirmed logical record header.
+// - Captures the current best typed interpretations for 01/11, 02/11, 03/11,
+//   04/01, 05/10, and 06/00.
+// - Preserves raw payload bytes for every record because several long-packet
+//   codecs are still unresolved.
+//
+// Notes:
+// - This is a format-description schema, not an official vendor definition.
+// - Little-endian layout and exact compression rules are documented here as
+//   comments; protobuf itself stores values in protobuf wire format.
+
+message DumpCapture {
+  string source_name = 1;
+  CaptureContainerType container_type = 2;
+  repeated OuterPayload outer_payloads = 3;
+}
+
+enum CaptureContainerType {
+  CAPTURE_CONTAINER_TYPE_UNKNOWN = 0;
+  CAPTURE_CONTAINER_TYPE_INDEXED_BIN = 1;
+  CAPTURE_CONTAINER_TYPE_LENGTH_PREFIXED_DAT = 2;
+}
+
+message OuterPayload {
+  uint32 index = 1;
+  bytes raw_data = 2;
+  repeated LogicalRecord records = 3;
+}
+
+message LogicalRecord {
+  // Confirmed on-wire logical header:
+  //   aa aa
+  //   record_id:u8
+  //   record_type:u8
+  //   payload_len:u16le
+  //   rate:u16le
+  //   flags:u32le
+  uint32 outer_index = 1;
+  uint32 offset = 2;
+  uint32 record_id = 3;
+  uint32 record_type = 4;
+  uint32 payload_len = 5;
+  uint32 rate = 6;
+  uint32 flags = 7;
+  RecordKind kind = 8;
+  bytes raw_payload = 9;
+
+  oneof interpreted_payload {
+    ByteDeltaWaveform waveform_01_11 = 20;
+    ByteDeltaWaveform waveform_02_11 = 21;
+    ByteDeltaWaveform waveform_03_11 = 22;
+    NibbleDeltaWaveform waveform_04_01 = 23;
+    Int32Metric metric_05_10 = 24;
+    MotionSummaryRecord motion_06_00 = 25;
+    EventCodeRecord event_0c_00 = 26;
+    EventPayload20Record event_0d_00 = 27;
+  }
+}
+
+enum RecordKind {
+  RECORD_KIND_UNKNOWN = 0;
+  RECORD_KIND_01_11_WAVEFORM = 273;  // 0x0111
+  RECORD_KIND_02_11_WAVEFORM = 529;  // 0x0211
+  RECORD_KIND_03_11_WAVEFORM = 785;  // 0x0311
+  RECORD_KIND_04_01_WAVEFORM = 1025; // 0x0401
+  RECORD_KIND_05_10_INT32_METRIC = 1296; // 0x0510
+  RECORD_KIND_06_00_MOTION_SUMMARY = 1536; // 0x0600
+  RECORD_KIND_0C_00_EVENT_CODE = 3072; // 0x0C00
+  RECORD_KIND_0D_00_EVENT_PAYLOAD = 3328; // 0x0D00
+}
+
+// Best current baseline model for 01/11, 02/11, and 03/11:
+// - first 2 payload bytes are a signed little-endian seed
+// - remaining bytes are baseline tokens
+// - baseline tokens decode best as first-order zigzag deltas
+// - longer packets likely use widened tokens, but the exact rule is unresolved
+message ByteDeltaWaveform {
+  sint32 seed = 1;
+  bytes encoded_body = 2;
+  uint32 nominal_sample_rate_hz = 3;
+  uint32 nominal_sample_count = 4;
+  ByteDeltaCodecFamily baseline_codec = 5;
+  ByteDeltaPredictor predictor = 6;
+  SensorHypothesis likely_sensor = 7;
+
+  // Optional decoded samples if an exporter chooses to materialize them.
+  repeated sint32 decoded_samples = 8;
+}
+
+enum ByteDeltaCodecFamily {
+  BYTE_DELTA_CODEC_FAMILY_UNKNOWN = 0;
+  BYTE_DELTA_CODEC_FAMILY_ZIGZAG8 = 1;
+  BYTE_DELTA_CODEC_FAMILY_SIGNED8 = 2;
+  BYTE_DELTA_CODEC_FAMILY_SIGNMAG8 = 3;
+}
+
+enum ByteDeltaPredictor {
+  BYTE_DELTA_PREDICTOR_UNKNOWN = 0;
+  BYTE_DELTA_PREDICTOR_FIRST_ORDER = 1;
+  BYTE_DELTA_PREDICTOR_SECOND_ORDER = 2;
+}
+
+// Best current baseline model for 04/01:
+// - first 2 payload bytes are a signed little-endian seed
+// - body is nibble-structured rather than byte-delta structured
+// - low nibble decodes best as a signed 4-bit delta stream
+// - high nibble controls repeated output emission for selected values
+// - long packets look like multi-span chunks, not simple widened-token escapes
+message NibbleDeltaWaveform {
+  sint32 seed = 1;
+  bytes encoded_body = 2;
+  uint32 nominal_sample_rate_hz = 3;
+  uint32 nominal_sample_count = 4;
+  uint32 start_skip_bytes = 5;
+  uint32 end_skip_bytes = 6;
+  NibbleDeltaCodecFamily low_nibble_codec = 7;
+  repeated uint32 high_nibble_repeat_values = 8;
+  SensorHypothesis likely_sensor = 9;
+
+  // Optional decoded samples if an exporter chooses to materialize them.
+  repeated sint32 decoded_samples = 10;
+}
+
+enum NibbleDeltaCodecFamily {
+  NIBBLE_DELTA_CODEC_FAMILY_UNKNOWN = 0;
+  NIBBLE_DELTA_CODEC_FAMILY_SIGNED4 = 1;
+  NIBBLE_DELTA_CODEC_FAMILY_ZIGZAG4 = 2;
+  NIBBLE_DELTA_CODEC_FAMILY_SIGNMAG4 = 3;
+}
+
+// 05/10 is a 4-byte little-endian signed integer.
+// Current meaning is unresolved; it behaves like a once-per-second derived
+// metric or control/status value rather than a raw waveform.
+message Int32Metric {
+  sint32 value = 1;
+  SensorHypothesis likely_sensor = 2;
+}
+
+// 06/00 consists of five fixed 16-byte subframes per logical record.
+// Current best subframe layout:
+//   dd dd a3 57
+//   field_a:u16le
+//   field_b:u16le
+//   x:i16le
+//   y:i16le
+//   z:i16le
+//   crc16:u16le   // CRC over the first 14 bytes
+message MotionSummaryRecord {
+  repeated MotionSubframe subframes = 1;
+  SensorHypothesis likely_sensor = 2;
+}
+
+message MotionSubframe {
+  fixed32 marker = 1;
+  uint32 field_a = 2;
+  uint32 field_b = 3;
+  sint32 x = 4;
+  sint32 y = 5;
+  sint32 z = 6;
+  uint32 crc16 = 7;
+  bool crc16_valid = 8;
+}
+
+message EventCodeRecord {
+  uint32 value = 1;
+}
+
+message EventPayload20Record {
+  bytes value = 1;
+}
+
+enum SensorHypothesis {
+  SENSOR_HYPOTHESIS_UNKNOWN = 0;
+  SENSOR_HYPOTHESIS_OXIMETRY_RED_OR_IR = 1;
+  SENSOR_HYPOTHESIS_OXIMETRY_RED_OR_IR_MATE = 2;
+  SENSOR_HYPOTHESIS_PAT = 3;
+  SENSOR_HYPOTHESIS_ACTIGRAPHY = 4;
+  SENSOR_HYPOTHESIS_BODY_POSITION = 5;
+  SENSOR_HYPOTHESIS_MOTION_SUMMARY = 6;
+  SENSOR_HYPOTHESIS_DERIVED_METRIC = 7;
+  SENSOR_HYPOTHESIS_EVENT = 8;
+}
