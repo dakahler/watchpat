@@ -14,6 +14,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import math
 import struct
 import sys
 import threading
@@ -46,6 +47,8 @@ MOTION_RATE = 5            # Subframes per second
 BUFFER_SIZE = WINDOW_SECONDS * WAVEFORM_RATE  # 1000 samples
 MOTION_BUFFER = WINDOW_SECONDS * MOTION_RATE  # 50 samples
 FPS = 15                   # GUI refresh rate
+DERIVED_HISTORY = 120      # Seconds of HR/SpO2 trend to display
+DERIVE_INTERVAL = 1.0      # Seconds between derived signal updates
 
 CHANNEL_COLORS = {
     "OxiA":  "#e74c3c",    # Red
@@ -62,6 +65,110 @@ POSITION_LABELS = {
     "x+": "Upright",
     "x-": "Inverted",
 }
+
+
+# ---------------------------------------------------------------------------
+# Real-time derived signal computation (adapted from watchpat_to_resmed_sd)
+# ---------------------------------------------------------------------------
+
+def _detect_peaks_rt(samples: np.ndarray, rate: int) -> list[int]:
+    """Detect pulse peaks in a waveform buffer. Returns peak indices."""
+    if len(samples) < rate * 3:
+        return []
+    # Baseline removal via moving average (~0.75 Hz window)
+    win = max(3, int(rate * 0.75))
+    kernel = np.ones(win) / win
+    baseline = np.convolve(samples, kernel, mode="same")
+    detrended = samples - baseline
+
+    abs_median = float(np.median(np.abs(detrended)))
+    threshold = max(20.0, abs_median * 1.5)
+    refractory = max(1, int(rate * 0.35))
+    prom_win = max(3, int(rate * 0.15))
+
+    peaks: list[int] = []
+    last_peak = -refractory
+    for i in range(1, len(detrended) - 1):
+        if i - last_peak < refractory:
+            continue
+        c = detrended[i]
+        if c <= threshold:
+            continue
+        if c <= detrended[i - 1] or c < detrended[i + 1]:
+            continue
+        lo = max(0, i - prom_win)
+        hi = min(len(detrended), i + prom_win + 1)
+        local_min = float(np.min(detrended[lo:hi]))
+        if (c - local_min) < threshold * 1.2:
+            continue
+        peaks.append(i)
+        last_peak = i
+    return peaks
+
+
+def _compute_heart_rate(samples: np.ndarray, rate: int) -> float:
+    """Compute heart rate (BPM) from a waveform buffer. Returns -1 on failure."""
+    peaks = _detect_peaks_rt(samples, rate)
+    if len(peaks) < 3:
+        return -1.0
+    # Compute BPM from plausible inter-peak intervals
+    bpms = []
+    min_ivl = rate * 60.0 / 140.0
+    max_ivl = rate * 60.0 / 40.0
+    for a, b in zip(peaks, peaks[1:]):
+        delta = b - a
+        if min_ivl <= delta <= max_ivl:
+            bpms.append(60.0 * rate / delta)
+    if len(bpms) < 2:
+        return -1.0
+    return float(np.median(bpms))
+
+
+def _sinusoid_amplitude(samples: np.ndarray, hz: float, rate: int) -> float:
+    """Amplitude of a sinusoid at frequency hz via single-bin DFT."""
+    if len(samples) == 0 or hz <= 0:
+        return 0.0
+    mean_val = float(np.mean(samples))
+    n = np.arange(len(samples))
+    angle = 2.0 * math.pi * hz * n / rate
+    centered = samples - mean_val
+    real_part = float(np.sum(centered * np.cos(angle)))
+    imag_part = float(-np.sum(centered * np.sin(angle)))
+    return (2.0 / len(samples)) * math.sqrt(real_part**2 + imag_part**2)
+
+
+def _compute_spo2_pair(red: np.ndarray, ir: np.ndarray, bpm: float,
+                       rate: int) -> tuple[float, float]:
+    """Compute SpO2 from a specific red/IR assignment using a 4-second window.
+    Returns (spo2, ratio) or (-1, -1) on failure."""
+    # Use a 4-second window from the tail, matching the batch converter
+    n = min(len(red), len(ir), rate * 4)
+    if n < rate * 2:
+        return -1.0, -1.0
+    red_win = red[-n:]
+    ir_win = ir[-n:]
+
+    red_dc = float(np.mean(red_win))
+    ir_dc = float(np.mean(ir_win))
+    # Reject when DC is near zero (delta-encoded baseline crossing zero)
+    if abs(red_dc) < 10.0 or abs(ir_dc) < 10.0:
+        return -1.0, -1.0
+
+    pulse_hz = bpm / 60.0
+    red_ac = _sinusoid_amplitude(red_win, pulse_hz, rate)
+    ir_ac = _sinusoid_amplitude(ir_win, pulse_hz, rate)
+    if red_ac <= 0 or ir_ac <= 0:
+        return -1.0, -1.0
+
+    # AC/DC modulation depth — reject if AC is implausibly large vs DC
+    if red_ac / abs(red_dc) > 0.5 or ir_ac / abs(ir_dc) > 0.5:
+        return -1.0, -1.0
+
+    ratio = abs((red_ac / red_dc) / (ir_ac / ir_dc))
+    spo2 = 116.0 - 25.0 * ratio
+    if 60.0 <= spo2 <= 100.0:
+        return spo2, ratio
+    return -1.0, ratio
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +191,19 @@ class SensorBuffers:
         self.accel_z = deque(maxlen=MOTION_BUFFER)
         self.field_a = deque(maxlen=MOTION_BUFFER)
         self.field_b = deque(maxlen=MOTION_BUFFER)
+
+        # Derived signals (1 Hz history)
+        self.hr_history = deque(maxlen=DERIVED_HISTORY)
+        self.spo2_history = deque(maxlen=DERIVED_HISTORY)
+        self.current_hr = -1.0
+        self.current_spo2 = -1.0
+        self._last_derive_time = 0.0
+        # SpO2 assignment tracking: decaying scores (recent performance)
+        self._spo2_score_ab = 0.0   # OxiA=red, OxiB=IR
+        self._spo2_score_ba = 0.0   # OxiB=red, OxiA=IR
+        # Raw SpO2 values before smoothing
+        self._spo2_raw = deque(maxlen=15)
+        self._spo2_ema = -1.0  # exponential moving average
 
         # Scalar state
         self.body_position = "?"
@@ -131,6 +251,83 @@ class SensorBuffers:
                 self.events.append(
                     f"#{self.packet_count}: {ev.kind.name} val={ev.value}")
 
+            # Compute derived HR/SpO2 at ~1 Hz
+            now = time.time()
+            if now - self._last_derive_time >= DERIVE_INTERVAL:
+                self._last_derive_time = now
+                self._update_derived()
+
+    def _update_derived(self):
+        """Compute heart rate and SpO2 from current raw buffers (called with lock held)."""
+        # Try PAT first, then OxiB, then OxiA for heart rate
+        hr = -1.0
+        for buf in (self.pat, self.oxi_b, self.oxi_a):
+            if len(buf) >= WAVEFORM_RATE * 5:
+                hr = _compute_heart_rate(np.array(buf), WAVEFORM_RATE)
+                if hr > 0:
+                    break
+        self.current_hr = hr
+        self.hr_history.append(hr if hr > 0 else float("nan"))
+
+        # SpO2: 4s window, decaying assignment scores, median-smooth output
+        spo2 = -1.0
+        min_samples = WAVEFORM_RATE * 4
+        if hr > 0 and len(self.oxi_a) >= min_samples and len(self.oxi_b) >= min_samples:
+            a_arr = np.array(self.oxi_a)
+            b_arr = np.array(self.oxi_b)
+
+            # Quality gate: reject when channels are nearly identical
+            # (device sending duplicate data = no real Red/IR separation)
+            n_check = min(len(a_arr), len(b_arr), WAVEFORM_RATE * 4)
+            a_tail = a_arr[-n_check:]
+            b_tail = b_arr[-n_check:]
+            dc_a, dc_b = float(np.mean(a_tail)), float(np.mean(b_tail))
+            if abs(dc_a) > 10 and abs(dc_b) > 10:
+                dc_ratio = dc_a / dc_b
+            else:
+                dc_ratio = 1.0  # can't determine → treat as invalid
+            # Channels are distinct when DC ratio is far from 1.0
+            # (real Red/IR typically have very different baselines)
+            channels_distinct = abs(dc_ratio - 1.0) > 0.08
+
+            if channels_distinct:
+                # Compute both assignments
+                spo2_ab, ratio_ab = _compute_spo2_pair(
+                    a_arr, b_arr, hr, WAVEFORM_RATE)
+                spo2_ba, ratio_ba = _compute_spo2_pair(
+                    b_arr, a_arr, hr, WAVEFORM_RATE)
+                # Decay old scores, then reward plausible ratios
+                self._spo2_score_ab *= 0.9
+                self._spo2_score_ba *= 0.9
+                if spo2_ab > 0 and ratio_ab > 0 and 0.4 <= ratio_ab <= 1.3:
+                    self._spo2_score_ab += 1.0 - abs(ratio_ab - 0.7)
+                if spo2_ba > 0 and ratio_ba > 0 and 0.4 <= ratio_ba <= 1.3:
+                    self._spo2_score_ba += 1.0 - abs(ratio_ba - 0.7)
+                # Pick assignment with better recent score
+                if self._spo2_score_ab >= self._spo2_score_ba:
+                    spo2 = spo2_ab if spo2_ab > 0 else spo2_ba
+                else:
+                    spo2 = spo2_ba if spo2_ba > 0 else spo2_ab
+
+        # Heavy smoothing: median filter + outlier rejection + EMA
+        self._spo2_raw.append(spo2)
+        valid_raw = sorted([v for v in self._spo2_raw if v > 0])
+        if valid_raw:
+            # Trimmed median: drop top/bottom 20% before taking median
+            trim = max(1, len(valid_raw) // 5)
+            trimmed = valid_raw[trim:-trim] if len(valid_raw) > 4 else valid_raw
+            med = trimmed[len(trimmed) // 2]
+            # EMA for further smoothing (alpha=0.15 → ~7s time constant)
+            if self._spo2_ema < 0:
+                self._spo2_ema = med
+            else:
+                self._spo2_ema += 0.15 * (med - self._spo2_ema)
+            self.current_spo2 = self._spo2_ema
+            self.spo2_history.append(self._spo2_ema)
+        else:
+            self.current_spo2 = -1.0
+            self.spo2_history.append(float("nan"))
+
     def _waveform_buf(self, name: str):
         return {"OxiA": self.oxi_a, "OxiB": self.oxi_b,
                 "PAT": self.pat, "Chest": self.chest}.get(name)
@@ -148,6 +345,10 @@ class SensorBuffers:
                 "accel_z": np.array(self.accel_z) if self.accel_z else np.array([]),
                 "field_a": np.array(self.field_a) if self.field_a else np.array([]),
                 "field_b": np.array(self.field_b) if self.field_b else np.array([]),
+                "hr_history": np.array(self.hr_history) if self.hr_history else np.array([]),
+                "spo2_history": np.array(self.spo2_history) if self.spo2_history else np.array([]),
+                "current_hr": self.current_hr,
+                "current_spo2": self.current_spo2,
                 "body_position": self.body_position,
                 "body_position_label": self.body_position_label,
                 "metric": self.metric_value,
@@ -171,23 +372,25 @@ class WatchPATDashboard:
 
     def _build_figure(self):
         self.fig = plt.figure(
-            figsize=(14, 9),
+            figsize=(16, 11),
             facecolor="#1a1a2e",
         )
         self.fig.canvas.manager.set_window_title("WatchPAT ONE Dashboard")
 
-        # Layout: left side = 4 waveform rows, right side = indicators
+        # Layout: 6 rows x 5 cols
+        # Left (cols 0-2): OxiA, OxiB, PAT, Chest, Heart Rate, SpO2
+        # Right (cols 3-4): HR readout, SpO2 readout, Body Pos, Accel, Session
         gs = GridSpec(
-            4, 5, figure=self.fig,
-            left=0.06, right=0.98, top=0.93, bottom=0.06,
-            hspace=0.35, wspace=0.4,
+            6, 5, figure=self.fig,
+            left=0.06, right=0.98, top=0.94, bottom=0.04,
+            hspace=0.40, wspace=0.4,
         )
 
         dark_bg = "#16213e"
         grid_color = "#2a2a4a"
         text_color = "#e0e0e0"
 
-        # -- Waveform axes (left 4 columns) --
+        # -- Waveform axes (left, rows 0-3) --
         self.wave_axes = {}
         self.wave_lines = {}
         channels = [
@@ -209,19 +412,87 @@ class WatchPATDashboard:
             ax.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
             ax.set_xlim(0, BUFFER_SIZE)
             ax.set_ylabel("", fontsize=7, color=text_color)
-            if row < 3:
-                ax.set_xticklabels([])
-            else:
-                ax.set_xlabel("Samples (last 10s)", fontsize=7,
-                              color=text_color)
+            ax.set_xticklabels([])
             line, = ax.plot([], [], color=CHANNEL_COLORS[name],
                             linewidth=0.8, antialiased=True)
             self.wave_axes[name] = ax
             self.wave_lines[name] = line
 
-        # -- Right panel: indicators --
-        # Body position (top right)
-        self.ax_pos = self.fig.add_subplot(gs[0, 3:])
+        # -- Heart Rate trend (row 4 left) --
+        self.ax_hr_trend = self.fig.add_subplot(gs[4, :3])
+        self.ax_hr_trend.set_facecolor(dark_bg)
+        self.ax_hr_trend.set_title("Heart Rate (BPM)", color=text_color,
+                                    fontsize=9, fontweight="bold",
+                                    loc="left", pad=4)
+        self.ax_hr_trend.tick_params(colors=text_color, labelsize=7)
+        self.ax_hr_trend.spines["top"].set_visible(False)
+        self.ax_hr_trend.spines["right"].set_visible(False)
+        for spine in self.ax_hr_trend.spines.values():
+            spine.set_color(grid_color)
+        self.ax_hr_trend.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
+        self.ax_hr_trend.set_xlim(0, DERIVED_HISTORY)
+        self.ax_hr_trend.set_ylim(40, 120)
+        self.ax_hr_trend.set_xticklabels([])
+        self.hr_trend_line, = self.ax_hr_trend.plot(
+            [], [], color="#e74c3c", linewidth=1.5)
+
+        # -- SpO2 trend (row 5 left) --
+        self.ax_spo2_trend = self.fig.add_subplot(gs[5, :3])
+        self.ax_spo2_trend.set_facecolor(dark_bg)
+        self.ax_spo2_trend.set_title("SpO2 (%)", color=text_color,
+                                      fontsize=9, fontweight="bold",
+                                      loc="left", pad=4)
+        self.ax_spo2_trend.tick_params(colors=text_color, labelsize=7)
+        self.ax_spo2_trend.spines["top"].set_visible(False)
+        self.ax_spo2_trend.spines["right"].set_visible(False)
+        for spine in self.ax_spo2_trend.spines.values():
+            spine.set_color(grid_color)
+        self.ax_spo2_trend.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
+        self.ax_spo2_trend.set_xlim(0, DERIVED_HISTORY)
+        self.ax_spo2_trend.set_ylim(85, 100)
+        self.ax_spo2_trend.set_xlabel("Seconds ago", fontsize=7,
+                                       color=text_color)
+        self.spo2_trend_line, = self.ax_spo2_trend.plot(
+            [], [], color="#3498db", linewidth=1.5)
+
+        # -- Right panel --
+
+        # Heart Rate readout (row 0 right)
+        self.ax_hr = self.fig.add_subplot(gs[0, 3:])
+        self.ax_hr.set_facecolor(dark_bg)
+        self.ax_hr.set_xlim(0, 1)
+        self.ax_hr.set_ylim(0, 1)
+        self.ax_hr.axis("off")
+        self.ax_hr.set_title("Heart Rate", color=text_color,
+                              fontsize=9, fontweight="bold", pad=4)
+        self.hr_value_text = self.ax_hr.text(
+            0.5, 0.55, "--", ha="center", va="center",
+            fontsize=36, fontweight="bold", color="#e74c3c",
+            transform=self.ax_hr.transAxes)
+        self.hr_unit_text = self.ax_hr.text(
+            0.5, 0.15, "BPM", ha="center", va="center",
+            fontsize=11, color=text_color,
+            transform=self.ax_hr.transAxes)
+
+        # SpO2 readout (row 1 right)
+        self.ax_spo2 = self.fig.add_subplot(gs[1, 3:])
+        self.ax_spo2.set_facecolor(dark_bg)
+        self.ax_spo2.set_xlim(0, 1)
+        self.ax_spo2.set_ylim(0, 1)
+        self.ax_spo2.axis("off")
+        self.ax_spo2.set_title("SpO2", color=text_color,
+                                fontsize=9, fontweight="bold", pad=4)
+        self.spo2_value_text = self.ax_spo2.text(
+            0.5, 0.55, "--", ha="center", va="center",
+            fontsize=36, fontweight="bold", color="#3498db",
+            transform=self.ax_spo2.transAxes)
+        self.spo2_unit_text = self.ax_spo2.text(
+            0.5, 0.15, "%", ha="center", va="center",
+            fontsize=11, color=text_color,
+            transform=self.ax_spo2.transAxes)
+
+        # Body position (row 2 right)
+        self.ax_pos = self.fig.add_subplot(gs[2, 3:])
         self.ax_pos.set_facecolor(dark_bg)
         self.ax_pos.set_xlim(0, 1)
         self.ax_pos.set_ylim(0, 1)
@@ -237,8 +508,8 @@ class WatchPATDashboard:
             fontsize=11, color=text_color,
             transform=self.ax_pos.transAxes)
 
-        # Accelerometer (row 1 right)
-        self.ax_accel = self.fig.add_subplot(gs[1, 3:])
+        # Accelerometer (row 3 right)
+        self.ax_accel = self.fig.add_subplot(gs[3, 3:])
         self.ax_accel.set_facecolor(dark_bg)
         self.ax_accel.set_title("Accelerometer", color=text_color,
                                 fontsize=9, fontweight="bold",
@@ -262,21 +533,8 @@ class WatchPATDashboard:
                              facecolor=dark_bg, edgecolor=grid_color,
                              labelcolor=text_color)
 
-        # Metric & motion fields (row 2 right)
-        self.ax_info = self.fig.add_subplot(gs[2, 3:])
-        self.ax_info.set_facecolor(dark_bg)
-        self.ax_info.set_xlim(0, 1)
-        self.ax_info.set_ylim(0, 1)
-        self.ax_info.axis("off")
-        self.ax_info.set_title("Sensor Status", color=text_color,
-                               fontsize=9, fontweight="bold", pad=4)
-        self.info_text = self.ax_info.text(
-            0.05, 0.85, "", fontsize=9, color=text_color,
-            fontfamily="monospace", verticalalignment="top",
-            transform=self.ax_info.transAxes)
-
-        # Stats (row 3 right)
-        self.ax_stats = self.fig.add_subplot(gs[3, 3:])
+        # Session stats (rows 4-5 right)
+        self.ax_stats = self.fig.add_subplot(gs[4:6, 3:])
         self.ax_stats.set_facecolor(dark_bg)
         self.ax_stats.set_xlim(0, 1)
         self.ax_stats.set_ylim(0, 1)
@@ -284,7 +542,7 @@ class WatchPATDashboard:
         self.ax_stats.set_title("Session", color=text_color,
                                 fontsize=9, fontweight="bold", pad=4)
         self.stats_text = self.ax_stats.text(
-            0.05, 0.85, "", fontsize=9, color=text_color,
+            0.05, 0.90, "", fontsize=9, color=text_color,
             fontfamily="monospace", verticalalignment="top",
             transform=self.ax_stats.transAxes)
 
@@ -339,6 +597,63 @@ class WatchPATDashboard:
             self.ax_accel.set_xlim(
                 0, max(len(snap["accel_x"]), MOTION_BUFFER))
 
+        # -- Update HR/SpO2 readouts --
+        hr = snap["current_hr"]
+        if hr > 0:
+            self.hr_value_text.set_text(f"{int(round(hr))}")
+            if hr > 100:
+                self.hr_value_text.set_color("#e74c3c")
+            elif hr < 50:
+                self.hr_value_text.set_color("#f39c12")
+            else:
+                self.hr_value_text.set_color("#2ecc71")
+        else:
+            self.hr_value_text.set_text("--")
+            self.hr_value_text.set_color("#7f8c8d")
+
+        spo2 = snap["current_spo2"]
+        if spo2 > 0:
+            self.spo2_value_text.set_text(f"{int(round(spo2))}")
+            if spo2 < 90:
+                self.spo2_value_text.set_color("#e74c3c")
+            elif spo2 < 94:
+                self.spo2_value_text.set_color("#f39c12")
+            else:
+                self.spo2_value_text.set_color("#3498db")
+        else:
+            self.spo2_value_text.set_text("--")
+            self.spo2_value_text.set_color("#7f8c8d")
+
+        # -- Update HR trend --
+        hr_data = snap["hr_history"]
+        if len(hr_data) > 0:
+            x = np.arange(len(hr_data))
+            self.hr_trend_line.set_data(x, hr_data)
+            self.ax_hr_trend.set_xlim(0, max(len(hr_data), DERIVED_HISTORY))
+            valid = hr_data[~np.isnan(hr_data)]
+            if len(valid) > 0:
+                lo, hi = float(np.min(valid)), float(np.max(valid))
+                margin = max((hi - lo) * 0.15, 5)
+                self.ax_hr_trend.set_ylim(
+                    max(30, lo - margin), min(180, hi + margin))
+        else:
+            self.hr_trend_line.set_data([], [])
+
+        # -- Update SpO2 trend --
+        spo2_data = snap["spo2_history"]
+        if len(spo2_data) > 0:
+            x = np.arange(len(spo2_data))
+            self.spo2_trend_line.set_data(x, spo2_data)
+            self.ax_spo2_trend.set_xlim(0, max(len(spo2_data), DERIVED_HISTORY))
+            valid = spo2_data[~np.isnan(spo2_data)]
+            if len(valid) > 0:
+                lo, hi = float(np.min(valid)), float(np.max(valid))
+                margin = max((hi - lo) * 0.15, 1)
+                self.ax_spo2_trend.set_ylim(
+                    max(60, lo - margin), min(100, hi + margin))
+        else:
+            self.spo2_trend_line.set_data([], [])
+
         # -- Update body position --
         pos = snap["body_position"]
         pos_label = snap["body_position_label"]
@@ -353,49 +668,37 @@ class WatchPATDashboard:
         axis_str = f"({pos})" if pos != "?" else ""
         self.pos_label.set_text(axis_str)
 
-        # -- Update info panel --
-        crc_ok, crc_total = snap["motion_crc"]
-        crc_str = f"{crc_ok}/{crc_total}" if crc_total > 0 else "-"
-        fa = snap["field_a"][-1] if len(snap["field_a"]) > 0 else 0
-        fb = snap["field_b"][-1] if len(snap["field_b"]) > 0 else 0
-        info_lines = [
-            f"Metric:    {snap['metric']:>8d}",
-            f"Motion A:  {fa:>8d}",
-            f"Motion B:  {fb:>8d}",
-            f"CRC:       {crc_str:>8s}",
-        ]
-        if snap["events"]:
-            info_lines.append(f"\nLast event:")
-            info_lines.append(f"  {snap['events'][-1]}")
-        self.info_text.set_text("\n".join(info_lines))
-
         # -- Update stats panel --
         elapsed = time.time() - snap["start_time"] if snap["start_time"] else 0
         pkt_rate = (snap["packet_count"] / elapsed) if elapsed > 0 else 0
         kb = snap["total_bytes"] / 1024
         mins = int(elapsed) // 60
         secs = int(elapsed) % 60
-        samples = {
-            name: len(snap[key])
-            for name, key in [("OxiA", "oxi_a"), ("OxiB", "oxi_b"),
-                              ("PAT", "pat"), ("Chest", "chest")]
-        }
-        buf_str = " ".join(f"{k}:{v}" for k, v in samples.items())
+        crc_ok, crc_total = snap["motion_crc"]
+        crc_str = f"{crc_ok}/{crc_total}" if crc_total > 0 else "-"
+        fa = snap["field_a"][-1] if len(snap["field_a"]) > 0 else 0
+        fb = snap["field_b"][-1] if len(snap["field_b"]) > 0 else 0
         stats_lines = [
             f"Packets:   {snap['packet_count']:>8d}",
             f"Data:      {kb:>7.1f} KB",
             f"Rate:      {pkt_rate:>7.1f} p/s",
             f"Elapsed:   {mins:>4d}m {secs:02d}s",
-            f"Buffer:    {buf_str}",
+            f"Metric:    {snap['metric']:>8d}",
+            f"Motion:    A={fa} B={fb}",
+            f"CRC:       {crc_str:>8s}",
         ]
+        if snap["events"]:
+            stats_lines.append(f"Event: {snap['events'][-1]}")
         self.stats_text.set_text("\n".join(stats_lines))
 
         # Return all artists that changed
         artists = list(self.wave_lines.values())
         artists.extend(self.accel_lines.values())
         artists.extend([
+            self.hr_value_text, self.spo2_value_text,
+            self.hr_trend_line, self.spo2_trend_line,
             self.pos_text, self.pos_label,
-            self.info_text, self.stats_text,
+            self.stats_text,
         ])
         return artists
 

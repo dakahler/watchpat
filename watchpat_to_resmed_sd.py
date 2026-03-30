@@ -469,7 +469,7 @@ def derive_spo2_for_assignment(
 
         ratio = abs((red_ac / red_dc) / (ir_ac / ir_dc))
         ratios.append(ratio)
-        spo2 = 110.0 - (25.0 * ratio)
+        spo2 = 116.0 - (25.0 * ratio)
         if 60.0 <= spo2 <= 100.0:
             series.append(int(round(spo2)))
         else:
