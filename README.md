@@ -154,13 +154,59 @@ Capture `.dat` files use a simple length-prefixed format for easy replay:
 
 Each payload is one complete `DATA_PACKET` containing ~1 second of sensor data across all channels.
 
+## Android App
+
+A standalone Android recorder app is included in the `android/` directory. It connects to the device over BLE, records raw `.dat` files to the phone, and can share them via standard Android share intents (email, Drive, etc.).
+
+### Requirements
+
+- Android 5.0+ (API 21)
+- Bluetooth LE
+- USB debugging enabled for sideloading
+
+### Build and install
+
+```bat
+build_apk.bat       # compiles watchpat-debug.apk
+install_apk.bat     # adb installs and launches on connected phone
+```
+
+Both scripts require:
+- [Android SDK](https://developer.android.com/studio) with `platform-tools` (for `adb`)
+- JDK 17 or 21 — set `JAVA_HOME` inside `build_apk.bat` if the path differs from the default
+
+The Gradle wrapper (`android/gradlew`) is included in the repo.
+
+### Usage
+
+1. Tap **Scan & Connect** — the app scans for `ITAMAR_*` devices and connects automatically
+2. Wait for **"Session confirmed"** (serial number appears)
+3. Tap **Start Recording**
+4. **Wait ~40 seconds** — the device has a firmware warmup period before it begins streaming data packets
+5. Record as long as needed; packet count increments every 10 packets
+6. Tap **Stop Recording**
+7. Tap **Share File** to export the `.dat` file via email, Drive, or any other app
+
+Recordings are saved to app-specific external storage and are not accessible via the phone's file manager — use the Share button or USB transfer.
+
+### Protocol notes
+
+The Android app implements the same NUS protocol as the Python client. Key implementation details:
+
+- BLE writes use `WRITE_WITHOUT_RESPONSE` to match the NUS RX characteristic properties
+- Every packet received from the device (including data packets) is ACKed — the device will stall and retransmit if ACKs are not sent
+- On unexpected disconnection the app attempts reconnection for up to 5 minutes and resumes the recording seamlessly into the same file
+
 ## Project Structure
 
 | File | Description |
 |------|-------------|
 | `watchpat_ble.py` | BLE client, protocol implementation, data decoding, CLI |
 | `watchpat_gui.py` | Real-time matplotlib dashboard |
-| `watchpat.proto` | Protobuf schema for the binary data format |
+| `watchpat_to_resmed_sd.py` | Export tool for ResMed SD card format |
+| `build_apk.bat` | Build the Android debug APK |
+| `install_apk.bat` | Install the APK via USB (adb) |
+| `android/` | Android Studio project (Java, API 21+) |
 
 ## Disclaimer
 

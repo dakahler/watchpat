@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WatchPAT Recorder</string>
+    <string name="btn_scan">Scan &amp; Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_start_recording">Start Recording</string>
+    <string name="btn_stop_recording">Stop Recording</string>
+    <string name="btn_share">Share File</string>
+</resources>
