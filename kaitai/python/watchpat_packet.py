@@ -184,6 +184,8 @@ class WatchpatPacket(KaitaiStruct):
             self._read()
 
         def _read(self):
+            self.record_count = self._io.read_u1()
+            self.sub_header = self._io.read_u2le()
             self.records = []
             i = 0
             while not self._io.is_eof():

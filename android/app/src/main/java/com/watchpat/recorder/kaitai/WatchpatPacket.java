@@ -223,6 +223,8 @@ public class WatchpatPacket extends KaitaiStruct {
             _read();
         }
         private void _read() {
+            this.recordCount = this._io.readU1();
+            this.subHeader = this._io.readU2le();
             this.records = new ArrayList<LogicalRecord>();
             {
                 int i = 0;
@@ -238,9 +240,13 @@ public class WatchpatPacket extends KaitaiStruct {
                 this.records.get(((Number) (i)).intValue())._fetchInstances();
             }
         }
+        private int recordCount;
+        private int subHeader;
         private List<LogicalRecord> records;
         private WatchpatPacket _root;
         private WatchpatPacket _parent;
+        public int recordCount() { return recordCount; }
+        public int subHeader() { return subHeader; }
         public List<LogicalRecord> records() { return records; }
         public WatchpatPacket _root() { return _root; }
         public WatchpatPacket _parent() { return _parent; }

@@ -163,6 +163,10 @@ types:
   # -------------------------------------------------------------------------
   data_packet_payload:
     seq:
+      - id: record_count
+        type: u1
+      - id: sub_header
+        type: u2
       - id: records
         type: logical_record
         repeat: eos
