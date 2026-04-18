@@ -29,14 +29,15 @@ from pathlib import Path
 from statistics import median
 from typing import Iterable
 
-
-RECORD_SYNC = 0xAAAA
-RECORD_HEADER_SIZE = 12
-
-RECORD_KIND_OXIA = 0x0111
-RECORD_KIND_OXIB = 0x0211
-RECORD_KIND_PAT = 0x0311
-RECORD_KIND_CHEST = 0x0401
+from watchpat_protocol import (
+    parse_data_payload,
+    decode_byte_delta_waveform,
+    decode_nibble_delta_waveform,
+    RECORD_KIND_OXIA,
+    RECORD_KIND_OXIB,
+    RECORD_KIND_PAT,
+    RECORD_KIND_CHEST,
+)
 
 WAVEFORM_KIND_NAMES = {
     RECORD_KIND_OXIA: "OxiA",
@@ -142,80 +143,32 @@ def read_dat_payloads(path: Path) -> Iterable[bytes]:
             yield payload
 
 
-def _zigzag_decode_8(value: int) -> int:
-    return (value >> 1) ^ -(value & 1)
-
-
-def _signed_nibble(value: int) -> int:
-    return value - 16 if value >= 8 else value
-
-
-def decode_byte_delta_waveform(payload: bytes) -> list[int]:
-    if len(payload) < 2:
-        return []
-    seed = struct.unpack_from("<h", payload, 0)[0]
-    samples = [seed]
-    acc = seed
-    for value in payload[2:]:
-        acc += _zigzag_decode_8(value)
-        samples.append(acc)
-    return samples
-
-
-def decode_nibble_delta_waveform(payload: bytes) -> list[int]:
-    if len(payload) < 3:
-        return []
-    seed = struct.unpack_from("<h", payload, 0)[0]
-    samples = [seed]
-    acc = seed
-    for value in payload[3:]:
-        low = value & 0x0F
-        high = (value >> 4) & 0x0F
-        acc += _signed_nibble(low)
-        samples.append(acc)
-        if high == 0 or high == 7:
-            samples.append(acc)
-    return samples
-
-
 def parse_capture(path: Path) -> dict[str, SignalSamples]:
     channels = {
         "OxiA": SignalSamples("OxiA", array("h"), 100),
         "OxiB": SignalSamples("OxiB", array("h"), 100),
-        "PAT": SignalSamples("PAT", array("h"), 100),
+        "PAT":  SignalSamples("PAT",  array("h"), 100),
         "Chest": SignalSamples("Chest", array("h"), 100),
     }
 
     for packet_payload in read_dat_payloads(path):
-        pos = 0
-        while pos + RECORD_HEADER_SIZE <= len(packet_payload):
-            sync = struct.unpack_from("<H", packet_payload, pos)[0]
-            if sync != RECORD_SYNC:
-                pos += 1
+        try:
+            dp = parse_data_payload(packet_payload)
+        except Exception:
+            continue
+
+        for rec in dp.records:
+            kind = (rec.record_id << 8) | rec.record_type
+            ch_name = WAVEFORM_KIND_NAMES.get(kind)
+            if ch_name is None:
                 continue
-
-            record_id = packet_payload[pos + 2]
-            record_type = packet_payload[pos + 3]
-            payload_len = struct.unpack_from("<H", packet_payload, pos + 4)[0]
-            rate = struct.unpack_from("<H", packet_payload, pos + 6)[0]
-            payload_start = pos + RECORD_HEADER_SIZE
-            payload_end = payload_start + payload_len
-            if payload_end > len(packet_payload):
-                break
-
-            record_payload = packet_payload[payload_start:payload_end]
-            kind = (record_id << 8) | record_type
-            channel_name = WAVEFORM_KIND_NAMES.get(kind)
-            if channel_name is not None:
-                if kind == RECORD_KIND_CHEST:
-                    decoded = decode_nibble_delta_waveform(record_payload)
-                else:
-                    decoded = decode_byte_delta_waveform(record_payload)
-                if decoded:
-                    channels[channel_name].rate_hz = rate or channels[channel_name].rate_hz
-                    channels[channel_name].samples.extend(decoded)
-
-            pos = payload_end
+            if kind == RECORD_KIND_CHEST:
+                decoded = decode_nibble_delta_waveform(rec._raw_payload)
+            else:
+                decoded = decode_byte_delta_waveform(rec._raw_payload)
+            if decoded:
+                channels[ch_name].rate_hz = rec.rate or channels[ch_name].rate_hz
+                channels[ch_name].samples.extend(decoded)
 
     return channels
 

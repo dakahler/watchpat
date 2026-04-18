@@ -19,9 +19,14 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
+import com.watchpat.recorder.kaitai.WatchpatPacket;
+import io.kaitai.struct.ByteBufferKaitaiStream;
+import io.kaitai.struct.KaitaiStream;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.LinkedList;
@@ -386,11 +391,16 @@ public class WatchPatBleManager {
 
     private void handleSessionConfirm(int packetId, byte[] packet) {
         byte[] payload = WatchPatProtocol.extractPayload(packet);
-        if (payload.length >= 58) {
-            deviceSerial = (payload[54] & 0xFF)
-                         | ((payload[55] & 0xFF) << 8)
-                         | ((payload[56] & 0xFF) << 16)
-                         | ((payload[57] & 0xFF) << 24);
+        try {
+            WatchpatPacket.SessionConfirmPayload scp =
+                new WatchpatPacket.SessionConfirmPayload(
+                    new ByteBufferKaitaiStream(payload), null, null);
+            Long serial = scp.serialNumber();
+            if (serial != null) {
+                deviceSerial = serial.intValue();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to parse session confirm: " + e.getMessage());
         }
         Log.d(TAG, "Session confirmed — serial=" + deviceSerial + " wasRecording=" + wasRecording);
 

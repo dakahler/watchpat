@@ -1,4 +1,4 @@
-﻿__pycache__
+__pycache__
 .vscode
 android/.gradle
 android/.idea
@@ -7,3 +7,4 @@ android/build/reports
 android/gradle
 android/local.properties
 .claude
+.venv
