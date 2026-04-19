@@ -4,7 +4,6 @@ android/.gradle
 android/.idea
 android/app/build
 android/build/reports
-android/gradle
 android/local.properties
 .claude
 .venv

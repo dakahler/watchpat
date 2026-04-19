@@ -31,35 +31,36 @@ public class WatchpatPacket extends KaitaiStruct {
     }
     private void _read() {
         this.header = new PacketHeader(this._io, this, _root);
+        int _bodyLen = header().totalLen() - 24;
         switch (header().opcode()) {
         case 1280: {
-            KaitaiStream _io_body = this._io.substream(header().totalLen() - 24);
-            this.body = new SessionConfirmPayload(_io_body, this, _root);
+            this._rawBody = this._io.readBytes(_bodyLen);
+            this.body = new SessionConfirmPayload(new ByteBufferKaitaiStream(this._rawBody), this, _root);
             break;
         }
         case 2048: {
-            KaitaiStream _io_body = this._io.substream(header().totalLen() - 24);
-            this.body = new DataPacketPayload(_io_body, this, _root);
+            this._rawBody = this._io.readBytes(_bodyLen);
+            this.body = new DataPacketPayload(new ByteBufferKaitaiStream(this._rawBody), this, _root);
             break;
         }
         case 4864: {
-            KaitaiStream _io_body = this._io.substream(header().totalLen() - 24);
-            this.body = new BitResponsePayload(_io_body, this, _root);
+            this._rawBody = this._io.readBytes(_bodyLen);
+            this.body = new BitResponsePayload(new ByteBufferKaitaiStream(this._rawBody), this, _root);
             break;
         }
         case 512: {
-            KaitaiStream _io_body = this._io.substream(header().totalLen() - 24);
-            this.body = new SessionConfirmPayload(_io_body, this, _root);
+            this._rawBody = this._io.readBytes(_bodyLen);
+            this.body = new SessionConfirmPayload(new ByteBufferKaitaiStream(this._rawBody), this, _root);
             break;
         }
         case 5632: {
-            KaitaiStream _io_body = this._io.substream(header().totalLen() - 24);
-            this.body = new TechStatusPayload(_io_body, this, _root);
+            this._rawBody = this._io.readBytes(_bodyLen);
+            this.body = new TechStatusPayload(new ByteBufferKaitaiStream(this._rawBody), this, _root);
             break;
         }
         default: {
-            KaitaiStream _io_body = this._io.substream(header().totalLen() - 24);
-            this.body = new RawPayload(_io_body, this, _root);
+            this._rawBody = this._io.readBytes(_bodyLen);
+            this.body = new RawPayload(new ByteBufferKaitaiStream(this._rawBody), this, _root);
             break;
         }
         }
@@ -280,20 +281,18 @@ public class WatchpatPacket extends KaitaiStruct {
             this.payloadLen = this._io.readU2le();
             this.rate = this._io.readU2le();
             this.flags = this._io.readU4le();
+            this._rawPayload = this._io.readBytes(payloadLen());
             switch (recordId() << 8 | recordType()) {
             case 1296: {
-                KaitaiStream _io_payload = this._io.substream(payloadLen());
-                this.payload = new MetricPayload(_io_payload, this, _root);
+                this.payload = new MetricPayload(new ByteBufferKaitaiStream(this._rawPayload), this, _root);
                 break;
             }
             case 1536: {
-                KaitaiStream _io_payload = this._io.substream(payloadLen());
-                this.payload = new MotionPayload(_io_payload, this, _root);
+                this.payload = new MotionPayload(new ByteBufferKaitaiStream(this._rawPayload), this, _root);
                 break;
             }
             default: {
-                KaitaiStream _io_payload = this._io.substream(payloadLen());
-                this.payload = new RawPayload(_io_payload, this, _root);
+                this.payload = new RawPayload(new ByteBufferKaitaiStream(this._rawPayload), this, _root);
                 break;
             }
             }
@@ -321,6 +320,7 @@ public class WatchpatPacket extends KaitaiStruct {
         private int payloadLen;
         private int rate;
         private long flags;
+        private byte[] _rawPayload;
         private KaitaiStruct payload;
         private WatchpatPacket _root;
         private WatchpatPacket.DataPacketPayload _parent;
@@ -330,6 +330,7 @@ public class WatchpatPacket extends KaitaiStruct {
         public int payloadLen() { return payloadLen; }
         public int rate() { return rate; }
         public long flags() { return flags; }
+        public byte[] rawPayload() { return _rawPayload; }
         public KaitaiStruct payload() { return payload; }
         public WatchpatPacket _root() { return _root; }
         public WatchpatPacket.DataPacketPayload _parent() { return _parent; }
@@ -785,10 +786,12 @@ public class WatchpatPacket extends KaitaiStruct {
     }
     private PacketHeader header;
     private KaitaiStruct body;
+    private byte[] _rawBody;
     private WatchpatPacket _root;
     private KaitaiStruct _parent;
     public PacketHeader header() { return header; }
     public KaitaiStruct body() { return body; }
+    public byte[] rawBody() { return _rawBody; }
     public WatchpatPacket _root() { return _root; }
     public KaitaiStruct _parent() { return _parent; }
 }
