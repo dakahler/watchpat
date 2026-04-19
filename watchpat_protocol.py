@@ -22,8 +22,17 @@ import sys
 # Make the generated Kaitai output importable regardless of working directory.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "kaitai", "python"))
 
-from watchpat_packet import WatchpatPacket  # noqa: E402 (path set above)
-from kaitaistruct import KaitaiStream, BytesIO, ValidationNotEqualError  # noqa: E402
+try:
+    from watchpat_packet import WatchpatPacket  # noqa: E402 (path set above)
+    from kaitaistruct import KaitaiStream, BytesIO, ValidationNotEqualError  # noqa: E402
+except ModuleNotFoundError as exc:
+    if exc.name == "kaitaistruct":
+        raise ModuleNotFoundError(
+            "watchpat_protocol requires the 'kaitaistruct' package. "
+            "Install project dependencies with 'pip install -r requirements.txt' "
+            "or use the repo virtualenv at '.venv/bin/python'."
+        ) from exc
+    raise
 
 __all__ = [
     # Kaitai types

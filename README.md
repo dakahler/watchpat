@@ -24,12 +24,25 @@ The BLE protocol and binary data format were reverse-engineered from the WatchPA
 ## Requirements
 
 - Python 3.10+
+- `kaitaistruct` — runtime needed by the generated packet parser
 - [bleak](https://github.com/hbldh/bleak) — BLE client library
 - [matplotlib](https://matplotlib.org/) — dashboard GUI
 - [numpy](https://numpy.org/) — numerical arrays for plotting
 
+Install everything with:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
 ```
-pip install bleak matplotlib numpy
+
+If you already have the repo virtualenv, run commands with `.venv/bin/python`.
+
+Minimal manual install:
+
+```
+pip install bleak kaitaistruct matplotlib numpy pytest
 ```
 
 ## Usage
