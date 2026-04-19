@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import struct
 import sys
 import threading
@@ -23,7 +24,26 @@ from collections import deque
 from queue import Queue, Empty
 
 import matplotlib
-matplotlib.use("TkAgg")
+
+
+def _configure_matplotlib_backend():
+    """Prefer a native interactive backend and avoid forcing Tk on macOS."""
+    backend_logger = logging.getLogger("watchpat.gui")
+    if os.environ.get("MPLBACKEND"):
+        return
+    preferred = ["MacOSX", "TkAgg"] if sys.platform == "darwin" else ["TkAgg"]
+    for backend in preferred:
+        try:
+            matplotlib.use(backend)
+            backend_logger.info("Using matplotlib backend: %s", backend)
+            return
+        except Exception:
+            backend_logger.debug(
+                "Matplotlib backend %s unavailable", backend, exc_info=True
+            )
+
+
+_configure_matplotlib_backend()
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import FancyBboxPatch, Circle
@@ -368,6 +388,8 @@ class WatchPATDashboard:
 
     def __init__(self, buffers: SensorBuffers):
         self.buffers = buffers
+        self.anim = None
+        self._closing = False
         self._build_figure()
 
     def _build_figure(self):
@@ -557,6 +579,13 @@ class WatchPATDashboard:
             color="#95a5a6",
         )
 
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+        manager = getattr(self.fig.canvas, "manager", None)
+        window = getattr(manager, "window", None)
+        protocol = getattr(window, "protocol", None)
+        if callable(protocol):
+            protocol("WM_DELETE_WINDOW", self.request_close)
+
     def update(self, frame):
         """Animation update callback."""
         snap = self.buffers.snapshot()
@@ -705,6 +734,19 @@ class WatchPATDashboard:
     def set_mode_label(self, text: str):
         self.mode_text.set_text(text)
 
+    def _on_close(self, _event):
+        self._closing = True
+        if self.anim and self.anim.event_source:
+            self.anim.event_source.stop()
+
+    def request_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        if self.anim and self.anim.event_source:
+            self.anim.event_source.stop()
+        plt.close(self.fig)
+
     def run(self):
         """Start the animation loop (blocks until window closes)."""
         self.anim = FuncAnimation(
@@ -712,6 +754,8 @@ class WatchPATDashboard:
             blit=False, cache_frame_data=False,
         )
         plt.show()
+        if self.anim and self.anim.event_source:
+            self.anim.event_source.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -744,7 +788,14 @@ def ble_feeder(serial: str, buffers: SensorBuffers,
         wp = WatchPATClient()
 
         logger.info("Scanning for WatchPAT devices (%0.fs)...", scan_time)
-        devices = await wp.scan(timeout=scan_time, serial_filter=serial)
+        devices = await wp.scan(
+            timeout=scan_time,
+            serial_filter=serial,
+            stop_event=stop_event,
+        )
+        if stop_event and stop_event.is_set():
+            logger.info("BLE feeder stopped during scan.")
+            return
         if not devices:
             logger.error("No WatchPAT devices found.")
             return
@@ -752,6 +803,9 @@ def ble_feeder(serial: str, buffers: SensorBuffers,
         device = devices[0]
         logger.info("Connecting to %s ...", device.name)
         await wp.connect(device)
+        if stop_event and stop_event.is_set():
+            logger.info("BLE feeder stopped before session start.")
+            return
 
         dump_file = None
         if output_path:
@@ -866,7 +920,7 @@ Examples:
         pass
     finally:
         stop_event.set()
-        t.join(timeout=5)
+        t.join(timeout=1.5)
         snap = buffers.snapshot()
         print(f"\nSession summary: {snap['packet_count']} packets, "
               f"{snap['total_bytes']/1024:.1f} KB")

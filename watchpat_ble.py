@@ -33,8 +33,15 @@ from watchpat_protocol import (
     motion_subframe_crc_valid,
 )
 
-from bleak import BleakClient, BleakScanner
-from bleak.backends.device import BLEDevice
+try:
+    from bleak import BleakClient, BleakScanner
+    from bleak.backends.device import BLEDevice
+    _BLEAK_AVAILABLE = True
+except ImportError:
+    BleakClient = None
+    BleakScanner = None
+    BLEDevice = None
+    _BLEAK_AVAILABLE = False
 
 logger = logging.getLogger("watchpat")
 
@@ -744,8 +751,11 @@ class WatchPATClient:
     # -- Scanning ----------------------------------------------------------
 
     @staticmethod
-    async def scan(timeout: float = 10.0, serial_filter: str = "") -> list[BLEDevice]:
+    async def scan(timeout: float = 10.0, serial_filter: str = "",
+                   stop_event=None, check_interval: float = 0.1) -> list:
         """Scan for WatchPAT devices. They advertise as 'ITAMAR_XXXXXXX'."""
+        if not _BLEAK_AVAILABLE:
+            raise RuntimeError("bleak is not installed. Run: pip install bleak")
         found = {}  # address -> device
 
         def detection_callback(device, adv_data):
@@ -764,8 +774,15 @@ class WatchPATClient:
 
         scanner = BleakScanner(detection_callback=detection_callback)
         await scanner.start()
-        await asyncio.sleep(timeout)
-        await scanner.stop()
+        try:
+            if stop_event is None:
+                await asyncio.sleep(timeout)
+            else:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline and not stop_event.is_set():
+                    await asyncio.sleep(check_interval)
+        finally:
+            await scanner.stop()
         return list(found.values())
 
     # -- Connection --------------------------------------------------------

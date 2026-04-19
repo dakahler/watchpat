@@ -1,0 +1,5 @@
+bleak
+kaitaistruct
+matplotlib
+numpy
+pytest
