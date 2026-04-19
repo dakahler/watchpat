@@ -79,6 +79,7 @@ python watchpat_ble.py --serial XXXXXXXXX --monitor --duration 60 -o capture.dat
 ### Live capture (GUI dashboard)
 
 ```bash
+python watchpat_gui.py                         # live auto-detect
 python watchpat_gui.py --serial XXXXXXXXX
 ```
 
@@ -95,6 +96,15 @@ python watchpat_ble.py --replay capture.dat --csv output_prefix
 python watchpat_gui.py --replay capture.dat
 python watchpat_gui.py --replay capture.dat --speed 10  # 10x speed
 ```
+
+## Tests
+
+```bash
+python tests/test_protocol.py
+python tests/test_gui.py
+```
+
+The GUI tests are headless and validate dashboard update/close behavior without opening a real desktop window.
 
 ## Protocol Overview
 
@@ -139,7 +149,7 @@ Each `DATA_PACKET` (opcode `0x0800`) payload contains multiple logical records, 
 | `05/10` | 1 Hz | Derived metric | 4-byte signed LE int |
 | `06/00` | 5 Hz | SBP motion/orientation | 5x 16-byte CRC'd subframes |
 | `0C/00` | rare | Event code | 2-byte LE value |
-| `0D/00` | rare | Event payload | 20 raw bytes |
+| `0D/00` | rare | Event payload | raw bytes |
 
 ### Motion Subframe (06/00)
 
@@ -165,7 +175,7 @@ Capture `.dat` files use a simple length-prefixed format for easy replay:
 [4-byte LE length][payload bytes][4-byte LE length][payload bytes]...
 ```
 
-Each payload is one complete `DATA_PACKET` containing ~1 second of sensor data across all channels.
+Each stored payload is the `DATA_PACKET` body only, meaning the bytes after the 24-byte BLE packet header. Each payload contains about 1 second of sensor data across all channels.
 
 ## Android App
 
@@ -179,14 +189,14 @@ A standalone Android recorder app is included in the `android/` directory. It co
 
 ### Build and install
 
-```bat
-build_apk.bat       # compiles watchpat-debug.apk
-install_apk.bat     # adb installs and launches on connected phone
+```bash
+python build_apk.py
+python install_apk.py
 ```
 
 Both scripts require:
 - [Android SDK](https://developer.android.com/studio) with `platform-tools` (for `adb`)
-- JDK 17 or 21 — set `JAVA_HOME` inside `build_apk.bat` if the path differs from the default
+- JDK 17 or 21. `build_apk.py` will use `JAVA_HOME` if set and otherwise tries common system locations.
 
 The Gradle wrapper (`android/gradlew`) is included in the repo.
 
@@ -217,8 +227,9 @@ The Android app implements the same NUS protocol as the Python client. Key imple
 | `watchpat_ble.py` | BLE client, protocol implementation, data decoding, CLI |
 | `watchpat_gui.py` | Real-time matplotlib dashboard |
 | `watchpat_to_resmed_sd.py` | Export tool for ResMed SD card format |
-| `build_apk.bat` | Build the Android debug APK |
-| `install_apk.bat` | Install the APK via USB (adb) |
+| `build_apk.py` | Build the Android debug APK |
+| `install_apk.py` | Install the APK via USB (adb) |
+| `tests/` | Protocol and headless GUI test coverage |
 | `android/` | Android Studio project (Java, API 21+) |
 
 ## Disclaimer
