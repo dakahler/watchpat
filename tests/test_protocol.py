@@ -27,6 +27,7 @@ from watchpat_protocol import (
     decode_byte_delta_waveform,
     decode_nibble_delta_waveform,
     motion_subframe_crc_valid,
+    parse_packet,
     parse_data_payload,
     verify_crc,
 )
@@ -71,6 +72,34 @@ class TestCrc(unittest.TestCase):
         bad[4] ^= 0xFF   # flip a byte in the timestamp
         self.assertFalse(verify_crc(bytes(bad)))
 
+    def test_verify_crc_rejects_short_packet(self):
+        self.assertFalse(verify_crc(b"\xBB\xBB"))
+
+    def test_crc_detects_crc_field_corruption(self):
+        bad = bytearray(PACKETS[0])
+        bad[22] ^= 0xFF
+        self.assertFalse(verify_crc(bytes(bad)))
+
+
+class TestParsePacket(unittest.TestCase):
+    def test_packet0_header_fields(self):
+        pkt = parse_packet(PACKETS[0])
+        self.assertEqual(pkt.header.signature, b"\xBB\xBB")
+        self.assertEqual(pkt.header.opcode, 0x0800)
+        self.assertEqual(pkt.header.total_len, len(PACKETS[0]))
+        self.assertEqual(pkt.header.packet_id, 2)
+        self.assertEqual(pkt.header.timestamp, 5600)
+        self.assertEqual(pkt.header.opcode_dependent, 0)
+        self.assertEqual(pkt.header.reserved, 0)
+
+    def test_all_packets_full_parse_and_length_match(self):
+        for i, raw in enumerate(PACKETS):
+            pkt = parse_packet(raw)
+            self.assertEqual(pkt.header.total_len, len(raw), f"packet {i} length")
+            self.assertEqual(pkt.header.opcode, 0x0800, f"packet {i} opcode")
+            self.assertEqual(pkt.body.record_count, len(pkt.body.records),
+                             f"packet {i} record count")
+
 
 class TestParseDataPayload(unittest.TestCase):
     def _payload(self, pkt_index):
@@ -104,6 +133,12 @@ class TestParseDataPayload(unittest.TestCase):
         for i in range(len(PACKETS)):
             dp = parse_data_payload(self._payload(i))
             self.assertGreater(len(dp.records), 0, f"packet {i} has no records")
+
+    def test_all_packets_record_count_matches_records(self):
+        for i in range(len(PACKETS)):
+            dp = parse_data_payload(self._payload(i))
+            self.assertEqual(dp.record_count, len(dp.records),
+                             f"packet {i} record count mismatch")
 
 
 class TestMetric(unittest.TestCase):
@@ -174,6 +209,16 @@ class TestByteDeltaWaveform(unittest.TestCase):
     def test_single_byte_payload_returns_empty(self):
         self.assertEqual(decode_byte_delta_waveform(b"\x00"), [])
 
+    def test_seed_only_payload_returns_single_sample(self):
+        self.assertEqual(decode_byte_delta_waveform(b"\xE8\x03"), [1000])
+
+    def test_handcrafted_negative_and_positive_deltas(self):
+        payload = b"\xE8\x03\x01\x04\x03"
+        self.assertEqual(
+            decode_byte_delta_waveform(payload),
+            [1000, 999, 1001, 999],
+        )
+
 
 class TestNibbleDeltaWaveform(unittest.TestCase):
     def _chest_raw(self, pkt_index=0):
@@ -204,6 +249,16 @@ class TestNibbleDeltaWaveform(unittest.TestCase):
 
     def test_short_payload_returns_empty(self):
         self.assertEqual(decode_nibble_delta_waveform(b"\x00\x00"), [])
+
+    def test_seed_and_skip_only_returns_single_sample(self):
+        self.assertEqual(decode_nibble_delta_waveform(b"\xE8\x03\x00"), [1000])
+
+    def test_handcrafted_nibble_deltas_and_repeat(self):
+        payload = b"\xE8\x03\x00\x70\x0F"
+        self.assertEqual(
+            decode_nibble_delta_waveform(payload),
+            [1000, 1000, 1000, 999, 999],
+        )
 
 
 class TestMotion(unittest.TestCase):
@@ -240,6 +295,20 @@ class TestMotion(unittest.TestCase):
             self.assertEqual(sf.x, x,       f"subframe {i} x")
             self.assertEqual(sf.y, y,       f"subframe {i} y")
             self.assertEqual(sf.z, z,       f"subframe {i} z")
+
+    def test_motion_crc_detects_modified_subframe(self):
+        rec = self._motion_record()
+        sf = rec.payload.subframes[0]
+
+        class ModifiedSubframe:
+            field_a = sf.field_a
+            field_b = sf.field_b
+            x = sf.x + 1
+            y = sf.y
+            z = sf.z
+            crc = sf.crc
+
+        self.assertFalse(motion_subframe_crc_valid(ModifiedSubframe()))
 
 
 class TestEventRecord(unittest.TestCase):
