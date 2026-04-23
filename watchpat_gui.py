@@ -86,6 +86,20 @@ POSITION_LABELS = {
     "x-": "Inverted",
 }
 
+# Event type labels and display colors (Itamar/AASM nomenclature)
+EVT_APNEA    = "APNEA"      # PAT attenuation + SpO₂ drop ≥4%   → pAHI
+EVT_HYPOPNEA = "HYPOPNEA"   # PAT attenuation + SpO₂ drop 3–4%  → pAHI
+EVT_RERA     = "RERA"       # PAT attenuation + HR rise ≥6 BPM   → pRDI only
+EVT_PAT      = "PAT"        # PAT attenuation, no confirmed marker
+EVT_CENTRAL  = "CENTRAL"    # SpO₂ drop without PAT attenuation  → possible central
+EVENT_COLORS = {
+    EVT_APNEA:    "#e74c3c",  # red
+    EVT_HYPOPNEA: "#e67e22",  # orange
+    EVT_RERA:     "#f1c40f",  # yellow
+    EVT_PAT:      "#95a5a6",  # gray
+    EVT_CENTRAL:  "#9b59b6",  # purple
+}
+
 
 # ---------------------------------------------------------------------------
 # Real-time derived signal computation (adapted from watchpat_to_resmed_sd)
@@ -236,6 +250,31 @@ class SensorBuffers:
         self.last_motion_crc_total = 0
         self.events = deque(maxlen=20)
 
+        # Apnea / AHI tracking (ODI3-based estimate: SpO2 drop ≥3% for ≥10 s)
+        self.spo2_full_history: deque = deque(maxlen=4 * 3600)  # 4 hr at 1 Hz
+        self.spo2_full_times: deque = deque(maxlen=4 * 3600)
+        self.apnea_events: list = []  # (elapsed_sec, spo2_nadir) per event
+        self.ahi_estimate = -1.0
+        self._desat_baseline: deque = deque(maxlen=120)  # 120 s rolling baseline
+        self._desat_in_event = False
+        self._desat_start_elapsed = 0.0
+        self._desat_nadir = 100.0
+
+        # PAT attenuation-based pAHI (US 6,561,984 / 7,909,768 methodology)
+        # Envelope = 3-s peak-to-peak; baseline = 75th-pct of non-event 5-min window
+        # Event: amplitude ≤70% of baseline for ≥10 s (≥30% attenuation)
+        # Confirmed: HR rise ≥6 BPM and/or concurrent SpO₂ drop ≥3%
+        self.pat_amp_history: deque = deque(maxlen=4 * 3600)  # 4 hr at 1 Hz (% baseline)
+        self.pat_amp_times: deque = deque(maxlen=4 * 3600)
+        self.pat_events: list = []  # (elapsed_sec, drop_ratio, hr_rise, spo2_drop)
+        self.pahi_estimate = -1.0
+        self._pat_baseline_buf: deque = deque(maxlen=300)  # 5-min non-event baseline
+        self._pat_in_event = False
+        self._pat_event_start = 0.0
+        self._pat_hr_baseline = -1.0
+        self.central_events: list = []  # (elapsed_sec, spo2_drop) — SpO₂ without PAT
+        self.rdi_estimate = -1.0        # pRDI = (APNEA + HYPOPNEA + RERA) / hr
+
     def feed(self, pkt: ParsedDataPacket):
         """Ingest a parsed data packet into the rolling buffers."""
         with self.lock:
@@ -348,6 +387,103 @@ class SensorBuffers:
             self.current_spo2 = -1.0
             self.spo2_history.append(float("nan"))
 
+        # ---- ODI3 apnea event detection ----
+        elapsed = time.time() - self.start_time if self.start_time else 0.0
+        if self.current_spo2 > 0:
+            self.spo2_full_history.append(self.current_spo2)
+            self.spo2_full_times.append(elapsed)
+            # Baseline only updated when NOT in a desaturation dip
+            if not self._desat_in_event:
+                self._desat_baseline.append(self.current_spo2)
+            if len(self._desat_baseline) >= 30:
+                baseline = float(np.percentile(list(self._desat_baseline), 90))
+                drop = baseline - self.current_spo2
+                if not self._desat_in_event:
+                    if drop >= 3.0:
+                        self._desat_in_event = True
+                        self._desat_start_elapsed = elapsed
+                        self._desat_nadir = self.current_spo2
+                else:
+                    self._desat_nadir = min(self._desat_nadir, self.current_spo2)
+                    if drop < 1.0:  # recovered within 1% of baseline
+                        if elapsed - self._desat_start_elapsed >= 10.0:
+                            self.apnea_events.append(
+                                (self._desat_start_elapsed, self._desat_nadir))
+                            # Central apnea candidate: SpO₂ drop with no PAT event
+                            # within ±60 s and no active PAT event now
+                            pat_times = [ev[0] for ev in self.pat_events]
+                            has_concurrent_pat = (
+                                self._pat_in_event or
+                                any(abs(t - self._desat_start_elapsed) <= 60.0
+                                    for t in pat_times))
+                            if not has_concurrent_pat:
+                                self.central_events.append(
+                                    (self._desat_start_elapsed,
+                                     baseline - self._desat_nadir))
+                        self._desat_in_event = False
+        # ---- PAT attenuation event detection (patent-based pAHI) ----
+        # 3-second peak-to-peak envelope; baseline = 75th-pct of last 5 min (non-event)
+        if len(self.pat) >= WAVEFORM_RATE * 3:
+            pat_arr = np.array(self.pat)
+            env = float(np.ptp(pat_arr[-WAVEFORM_RATE * 3:]))
+            if env > 0:
+                if not self._pat_in_event:
+                    self._pat_baseline_buf.append(env)
+                if len(self._pat_baseline_buf) >= 30:
+                    pat_baseline = float(
+                        np.percentile(list(self._pat_baseline_buf), 75))
+                    ratio = env / pat_baseline if pat_baseline > 0 else 1.0
+                    self.pat_amp_history.append(ratio * 100.0)
+                    self.pat_amp_times.append(elapsed)
+                    if not self._pat_in_event:
+                        if ratio <= 0.70:  # ≥30% attenuation → event start
+                            self._pat_in_event = True
+                            self._pat_event_start = elapsed
+                            self._pat_hr_baseline = self.current_hr
+                    else:
+                        recovered = ratio > 0.80
+                        timed_out = elapsed - self._pat_event_start > 120.0
+                        if recovered or timed_out:
+                            duration = elapsed - self._pat_event_start
+                            if 10.0 <= duration <= 120.0:
+                                hr_rise = (
+                                    self.current_hr - self._pat_hr_baseline
+                                    if self._pat_hr_baseline > 0
+                                    and self.current_hr > 0 else 0.0)
+                                # SpO₂ drop over the event window
+                                n_look = min(int(duration) + 5,
+                                             len(self.spo2_full_history))
+                                spo2_drop = 0.0
+                                if n_look >= 2:
+                                    recent = list(
+                                        self.spo2_full_history)[-n_look:]
+                                    valid = [v for v in recent if v > 0]
+                                    if valid:
+                                        spo2_drop = max(
+                                            0.0, max(valid) - min(valid))
+                                if spo2_drop >= 4.0:
+                                    evt_type = EVT_APNEA
+                                elif spo2_drop >= 3.0:
+                                    evt_type = EVT_HYPOPNEA
+                                elif hr_rise >= 6.0:
+                                    evt_type = EVT_RERA
+                                else:
+                                    evt_type = EVT_PAT
+                                self.pat_events.append(
+                                    (self._pat_event_start, ratio,
+                                     hr_rise, spo2_drop, evt_type))
+                            self._pat_in_event = False
+
+        # Update pAHI, pRDI, and ODI3 estimates
+        if elapsed >= 60.0 and self.start_time:
+            hours = elapsed / 3600.0
+            n_apnea = sum(1 for ev in self.pat_events if ev[4] == EVT_APNEA)
+            n_hyp   = sum(1 for ev in self.pat_events if ev[4] == EVT_HYPOPNEA)
+            n_rera  = sum(1 for ev in self.pat_events if ev[4] == EVT_RERA)
+            self.ahi_estimate  = len(self.apnea_events) / hours
+            self.pahi_estimate = (n_apnea + n_hyp) / hours
+            self.rdi_estimate  = (n_apnea + n_hyp + n_rera) / hours
+
     def _waveform_buf(self, name: str):
         return {"OxiA": self.oxi_a, "OxiB": self.oxi_b,
                 "PAT": self.pat, "Chest": self.chest}.get(name)
@@ -377,6 +513,20 @@ class SensorBuffers:
                 "start_time": self.start_time,
                 "motion_crc": (self.last_motion_crc_ok, self.last_motion_crc_total),
                 "events": list(self.events),
+                "spo2_full_history": (np.array(self.spo2_full_history)
+                                      if self.spo2_full_history else np.array([])),
+                "spo2_full_times": (np.array(self.spo2_full_times)
+                                    if self.spo2_full_times else np.array([])),
+                "apnea_events": list(self.apnea_events),
+                "ahi_estimate": self.ahi_estimate,
+                "pat_amp_history": (np.array(self.pat_amp_history)
+                                    if self.pat_amp_history else np.array([])),
+                "pat_amp_times": (np.array(self.pat_amp_times)
+                                  if self.pat_amp_times else np.array([])),
+                "pat_events": list(self.pat_events),
+                "pahi_estimate": self.pahi_estimate,
+                "rdi_estimate": self.rdi_estimate,
+                "central_events": list(self.central_events),
             }
 
 
@@ -394,18 +544,19 @@ class WatchPATDashboard:
 
     def _build_figure(self):
         self.fig = plt.figure(
-            figsize=(16, 11),
+            figsize=(16, 13),
             facecolor="#1a1a2e",
         )
         self.fig.canvas.manager.set_window_title("WatchPAT ONE Dashboard")
 
-        # Layout: 6 rows x 5 cols
-        # Left (cols 0-2): OxiA, OxiB, PAT, Chest, Heart Rate, SpO2
-        # Right (cols 3-4): HR readout, SpO2 readout, Body Pos, Accel, Session
+        # Layout: 7 rows x 5 cols
+        # Left (cols 0-2, rows 0-5): OxiA, OxiB, PAT, Chest, Heart Rate, SpO2
+        # Right (cols 3-4, rows 0-5): HR readout, SpO2 readout, Body Pos, Accel, Session
+        # Full width (row 6): Apnea Events Timeline
         gs = GridSpec(
-            6, 5, figure=self.fig,
+            7, 5, figure=self.fig,
             left=0.06, right=0.98, top=0.94, bottom=0.04,
-            hspace=0.40, wspace=0.4,
+            hspace=0.45, wspace=0.4,
         )
 
         dark_bg = "#16213e"
@@ -579,6 +730,61 @@ class WatchPATDashboard:
             color="#95a5a6",
         )
 
+        # -- Apnea / PAT Events Timeline (row 6, full width) --
+        self.ax_apnea = self.fig.add_subplot(gs[6, :])
+        self.ax_apnea.set_facecolor(dark_bg)
+        self.ax_apnea.set_title(
+            "Apnea Events  —  orange: PAT attenuation ≥30%  |  red: SpO₂ drop ≥3%",
+            color=text_color, fontsize=9, fontweight="bold", loc="left", pad=4)
+        self.ax_apnea.tick_params(colors=text_color, labelsize=7)
+        self.ax_apnea.spines["top"].set_visible(False)
+        for spine in self.ax_apnea.spines.values():
+            spine.set_color(grid_color)
+        self.ax_apnea.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
+        self.ax_apnea.set_ylim(80, 102)
+        self.ax_apnea.set_xlabel("Elapsed (min)", fontsize=7, color=text_color)
+        self.ax_apnea.set_ylabel("SpO₂ (%)", fontsize=7, color="#3498db")
+        self.ax_apnea.tick_params(axis="y", colors="#3498db")
+        self.ax_apnea.set_title(
+            "Apnea Events  —  "
+            "■ Apnea  ■ Hypopnea  ■ RERA  ■ Central (no PAT)",
+            color=text_color, fontsize=9, fontweight="bold", loc="left", pad=4)
+        self.spo2_full_line, = self.ax_apnea.plot(
+            [], [], color="#3498db", linewidth=1.0)
+        # Colored legend squares drawn as text spans
+        _legend_x = [0.01, 0.09, 0.19, 0.25]
+        for xpos, color in zip(_legend_x,
+                                [EVENT_COLORS[EVT_APNEA],
+                                 EVENT_COLORS[EVT_HYPOPNEA],
+                                 EVENT_COLORS[EVT_RERA],
+                                 EVENT_COLORS[EVT_CENTRAL]]):
+            self.ax_apnea.text(xpos, 0.97, "■", ha="left", va="top",
+                               color=color, fontsize=9,
+                               transform=self.ax_apnea.transAxes)
+        # Per-type event line tracking (incremental, never removed)
+        self._evt_lines: dict[str, list] = {t: [] for t in EVENT_COLORS}
+        self._drawn_evt_count: dict[str, int] = {t: 0 for t in EVENT_COLORS}
+
+        # Secondary y-axis: PAT amplitude as % of rolling baseline
+        self.ax_pat_amp = self.ax_apnea.twinx()
+        self.ax_pat_amp.set_facecolor("none")
+        self.ax_pat_amp.set_ylim(0, 150)
+        self.ax_pat_amp.set_ylabel("PAT amp (% baseline)", fontsize=7,
+                                    color="#2ecc71")
+        self.ax_pat_amp.tick_params(axis="y", colors="#2ecc71", labelsize=7)
+        self.ax_pat_amp.spines["right"].set_color("#2ecc71")
+        self.ax_pat_amp.spines["top"].set_visible(False)
+        self.ax_pat_amp.spines["left"].set_visible(False)
+        self.ax_pat_amp.axhline(y=70, color="#f39c12", linewidth=0.8,
+                                 linestyle="--", alpha=0.7)
+        self.pat_amp_line, = self.ax_pat_amp.plot(
+            [], [], color="#2ecc71", linewidth=0.8, alpha=0.85)
+
+        self.ax_apnea_ahi_text = self.ax_apnea.text(
+            0.99, 0.93, "pAHI: --",
+            ha="right", va="top", fontsize=9, fontweight="bold",
+            color="#7f8c8d", transform=self.ax_apnea.transAxes)
+
         self.fig.canvas.mpl_connect("close_event", self._on_close)
         manager = getattr(self.fig.canvas, "manager", None)
         window = getattr(manager, "window", None)
@@ -697,6 +903,82 @@ class WatchPATDashboard:
         axis_str = f"({pos})" if pos != "?" else ""
         self.pos_label.set_text(axis_str)
 
+        # -- Update apnea / PAT events panel --
+        spo2_times = snap["spo2_full_times"]
+        spo2_full = snap["spo2_full_history"]
+        t_max_min = 1.0
+        if len(spo2_times) > 0:
+            t_min = spo2_times / 60.0
+            t_max_min = max(float(t_min[-1]), 1.0)
+            self.spo2_full_line.set_data(t_min, spo2_full)
+            self.ax_apnea.set_xlim(0, t_max_min)
+            valid_spo2 = spo2_full[~np.isnan(spo2_full)]
+            if len(valid_spo2) > 0:
+                lo = max(60.0, float(np.min(valid_spo2)) - 2)
+                self.ax_apnea.set_ylim(lo, 102)
+        else:
+            self.spo2_full_line.set_data([], [])
+
+        # PAT amplitude trace
+        pat_times = snap["pat_amp_times"]
+        pat_amps = snap["pat_amp_history"]
+        if len(pat_times) > 0:
+            self.pat_amp_line.set_data(pat_times / 60.0, pat_amps)
+            self.ax_pat_amp.set_xlim(0, t_max_min)
+        else:
+            self.pat_amp_line.set_data([], [])
+
+        # PAT events: draw new markers per type (incremental)
+        pat_events = snap["pat_events"]
+        drawn = self._drawn_evt_count
+        n_new_pat = len(pat_events) - drawn[EVT_APNEA] - drawn[EVT_HYPOPNEA] \
+                    - drawn[EVT_RERA] - drawn[EVT_PAT]
+        if n_new_pat > 0:
+            already_drawn = sum(drawn[t] for t in [EVT_APNEA, EVT_HYPOPNEA,
+                                                    EVT_RERA, EVT_PAT])
+            for ev_time, _, _, _, evt_type in pat_events[already_drawn:]:
+                color = EVENT_COLORS.get(evt_type, "#95a5a6")
+                vl = self.ax_apnea.axvline(
+                    x=ev_time / 60.0, color=color, alpha=0.75, linewidth=1.5)
+                self._evt_lines[evt_type].append(vl)
+                self._drawn_evt_count[evt_type] += 1
+
+        # Central apnea markers (purple) — incremental
+        central_events = snap["central_events"]
+        n_new_central = len(central_events) - drawn[EVT_CENTRAL]
+        if n_new_central > 0:
+            for ev_time, _ in central_events[drawn[EVT_CENTRAL]:]:
+                vl = self.ax_apnea.axvline(
+                    x=ev_time / 60.0, color=EVENT_COLORS[EVT_CENTRAL],
+                    alpha=0.75, linewidth=1.5)
+                self._evt_lines[EVT_CENTRAL].append(vl)
+                self._drawn_evt_count[EVT_CENTRAL] += 1
+
+        # AHI/RDI text
+        pahi = snap["pahi_estimate"]
+        rdi  = snap["rdi_estimate"]
+        ahi  = snap["ahi_estimate"]
+        n_central = len(central_events)
+        counts = {t: drawn[t] for t in EVENT_COLORS}  # snapshot of drawn counts
+        primary = pahi if pahi >= 0 else ahi
+        if primary >= 0:
+            n_a = self._drawn_evt_count[EVT_APNEA]
+            n_h = self._drawn_evt_count[EVT_HYPOPNEA]
+            n_r = self._drawn_evt_count[EVT_RERA]
+            rdi_str = f"{rdi:.1f}" if rdi >= 0 else "--"
+            label = (f"pAHI: {pahi:.1f}/hr  pRDI: {rdi_str}/hr"
+                     f"  (A:{n_a} H:{n_h} R:{n_r} C:{n_central})")
+            self.ax_apnea_ahi_text.set_text(label)
+            if primary < 5:
+                self.ax_apnea_ahi_text.set_color("#2ecc71")
+            elif primary < 15:
+                self.ax_apnea_ahi_text.set_color("#f39c12")
+            else:
+                self.ax_apnea_ahi_text.set_color("#e74c3c")
+        else:
+            self.ax_apnea_ahi_text.set_text("pAHI: --")
+            self.ax_apnea_ahi_text.set_color("#7f8c8d")
+
         # -- Update stats panel --
         elapsed = time.time() - snap["start_time"] if snap["start_time"] else 0
         pkt_rate = (snap["packet_count"] / elapsed) if elapsed > 0 else 0
@@ -707,11 +989,19 @@ class WatchPATDashboard:
         crc_str = f"{crc_ok}/{crc_total}" if crc_total > 0 else "-"
         fa = snap["field_a"][-1] if len(snap["field_a"]) > 0 else 0
         fb = snap["field_b"][-1] if len(snap["field_b"]) > 0 else 0
+        pahi_val = snap["pahi_estimate"]
+        rdi_val  = snap["rdi_estimate"]
+        pahi_str = f"{pahi_val:.1f}" if pahi_val >= 0.0 else "--"
+        rdi_str  = f"{rdi_val:.1f}"  if rdi_val  >= 0.0 else "--"
+        n_central_stat = len(snap["central_events"])
         stats_lines = [
             f"Packets:   {snap['packet_count']:>8d}",
             f"Data:      {kb:>7.1f} KB",
             f"Rate:      {pkt_rate:>7.1f} p/s",
             f"Elapsed:   {mins:>4d}m {secs:02d}s",
+            f"pAHI:      {pahi_str:>5s} /hr",
+            f"pRDI:      {rdi_str:>5s} /hr",
+            f"Central:   {n_central_stat:>8d}",
             f"Metric:    {snap['metric']:>8d}",
             f"Motion:    A={fa} B={fb}",
             f"CRC:       {crc_str:>8s}",
@@ -728,7 +1018,12 @@ class WatchPATDashboard:
             self.hr_trend_line, self.spo2_trend_line,
             self.pos_text, self.pos_label,
             self.stats_text,
+            self.spo2_full_line,
+            self.pat_amp_line,
+            self.ax_apnea_ahi_text,
         ])
+        for lines in self._evt_lines.values():
+            artists.extend(lines)
         return artists
 
     def set_mode_label(self, text: str):
