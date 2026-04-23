@@ -65,6 +65,57 @@ class TestWatchPATDashboard(unittest.TestCase):
         self.assertEqual(len(self.dashboard.accel_lines["x"].get_ydata()), 3)
         self.assertGreater(len(artists), 0)
 
+    def test_update_renders_pahi_prdi_counts_and_central_stats(self):
+        now = time.time()
+        with self.buffers.lock:
+            self.buffers.start_time = now - 3600
+            self.buffers.spo2_full_times.extend([60.0, 120.0, 180.0])
+            self.buffers.spo2_full_history.extend([96.0, 94.0, 95.0])
+            self.buffers.pat_amp_times.extend([60.0, 120.0, 180.0])
+            self.buffers.pat_amp_history.extend([92.0, 68.0, 88.0])
+            self.buffers.pat_events = [
+                (60.0, 0.5, 8.0, 4.2, watchpat_gui.EVT_APNEA),
+                (120.0, 0.6, 4.0, 3.2, watchpat_gui.EVT_HYPOPNEA),
+                (180.0, 0.6, 7.5, 1.0, watchpat_gui.EVT_RERA),
+            ]
+            self.buffers.central_events = [(240.0, 4.0)]
+            self.buffers.pahi_estimate = 2.0
+            self.buffers.rdi_estimate = 3.0
+
+        self.dashboard.update(frame=0)
+
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_APNEA], 1)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_HYPOPNEA], 1)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_RERA], 1)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_CENTRAL], 1)
+        self.assertEqual(
+            self.dashboard.ax_apnea_ahi_text.get_text(),
+            "pAHI: 2.0/hr  pRDI: 3.0/hr  (A:1 H:1 R:1 C:1)",
+        )
+        self.assertEqual(self.dashboard.ax_apnea_ahi_text.get_color(), "#2ecc71")
+        stats_text = self.dashboard.stats_text.get_text()
+        self.assertIn("pAHI:        2.0 /hr", stats_text)
+        self.assertIn("pRDI:        3.0 /hr", stats_text)
+        self.assertIn("Central:          1", stats_text)
+
+    def test_update_ahi_color_thresholds_follow_pahi_severity(self):
+        cases = [
+            (4.9, "#2ecc71"),
+            (5.0, "#f39c12"),
+            (15.0, "#e74c3c"),
+        ]
+
+        for pahi, expected_color in cases:
+            with self.subTest(pahi=pahi):
+                with self.buffers.lock:
+                    self.buffers.pahi_estimate = pahi
+                    self.buffers.rdi_estimate = pahi + 1.0
+                self.dashboard.update(frame=0)
+                self.assertEqual(
+                    self.dashboard.ax_apnea_ahi_text.get_color(),
+                    expected_color,
+                )
+
     def test_request_close_stops_animation_once(self):
         stop = mock.Mock()
         self.dashboard.anim = mock.Mock(event_source=mock.Mock(stop=stop))
@@ -113,6 +164,187 @@ class TestBleFeeder(unittest.TestCase):
         self.assertEqual(fake.scan_args[1], "SER123")
         self.assertIs(fake.scan_args[2], stop_event)
         fake.connect.assert_not_awaited()
+
+
+class TestApneaClassification(unittest.TestCase):
+    """Tests for PAT event classification, AHI/RDI counting, and central detection.
+
+    Strategy: directly manipulate SensorBuffers internal state to set up each
+    scenario, then call _update_derived() to run the classification logic.
+
+    PAT envelope is synthesized as a 1.2 Hz sinusoid (≈72 BPM) with amplitude
+    1000.  With a pre-seeded baseline of 1000, the recovered ratio is ≈2.0 which
+    is well above the 0.80 recovery threshold, triggering event termination and
+    classification on every call.
+    """
+
+    RATE = watchpat_gui.WAVEFORM_RATE  # 100 Hz
+
+    def _sinusoid(self, amplitude=1000, n_samples=500, freq_hz=1.2):
+        t = np.arange(n_samples)
+        return (amplitude * np.sin(2 * np.pi * freq_hz * t / self.RATE)).astype(int).tolist()
+
+    def _recovering_buffers(self, spo2_history, hr_baseline,
+                             event_duration_s=15.0):
+        """Return SensorBuffers with a PAT event that is currently recovering.
+
+        The PAT buffer contains a high-amplitude sinusoid (ratio ≈2.0 vs
+        pre-seeded baseline of 1000), so _update_derived will detect recovery
+        and classify the event.  spo2_full_history is pre-populated with the
+        supplied values so the spo2_drop measurement uses those directly.
+        """
+        buf = watchpat_gui.SensorBuffers()
+        now = time.time()
+        with buf.lock:
+            buf.start_time = now - 3600
+            elapsed = time.time() - buf.start_time  # ≈3600 s
+            buf.pat.extend(self._sinusoid(amplitude=1000))
+            buf._pat_baseline_buf.extend([1000.0] * 100)
+            buf._pat_in_event = True
+            buf._pat_event_start = elapsed - event_duration_s
+            buf._pat_hr_baseline = float(hr_baseline)
+            buf.spo2_full_history.extend(spo2_history)
+        return buf
+
+    # ------------------------------------------------------------------
+    # Snapshot field coverage
+    # ------------------------------------------------------------------
+
+    def test_snapshot_includes_new_fields(self):
+        buf = watchpat_gui.SensorBuffers()
+        snap = buf.snapshot()
+        for key in ("pat_amp_history", "pat_amp_times", "pat_events",
+                    "pahi_estimate", "rdi_estimate", "central_events"):
+            self.assertIn(key, snap, msg=f"snapshot missing: {key}")
+
+    # ------------------------------------------------------------------
+    # PAT event type classification
+    # ------------------------------------------------------------------
+
+    def test_pat_event_classified_as_apnea(self):
+        """PAT attenuation + SpO₂ drop ≥4% → APNEA."""
+        buf = self._recovering_buffers([96.0] * 10 + [91.0] * 10,
+                                       hr_baseline=60.0)
+        with buf.lock:
+            buf._update_derived()
+        self.assertEqual(len(buf.pat_events), 1)
+        self.assertEqual(buf.pat_events[0][4], watchpat_gui.EVT_APNEA)
+
+    def test_pat_event_classified_as_hypopnea(self):
+        """PAT attenuation + SpO₂ drop 3–4% → HYPOPNEA."""
+        buf = self._recovering_buffers([96.0] * 10 + [92.5] * 10,
+                                       hr_baseline=60.0)
+        with buf.lock:
+            buf._update_derived()
+        self.assertEqual(len(buf.pat_events), 1)
+        self.assertEqual(buf.pat_events[0][4], watchpat_gui.EVT_HYPOPNEA)
+
+    def test_pat_event_classified_as_rera(self):
+        """PAT attenuation + HR rise ≥6 BPM, SpO₂ drop <3% → RERA.
+
+        The sinusoid produces HR ≈72 BPM; with hr_baseline=60 that gives
+        hr_rise ≈12, reliably above the 6 BPM threshold.
+        """
+        buf = self._recovering_buffers([96.0] * 20, hr_baseline=60.0)
+        with mock.patch.object(watchpat_gui, "_compute_heart_rate", return_value=72.0):
+            with buf.lock:
+                buf._update_derived()
+        self.assertEqual(len(buf.pat_events), 1)
+        self.assertEqual(buf.pat_events[0][4], watchpat_gui.EVT_RERA)
+
+    def test_pat_event_classified_as_pat_when_no_markers(self):
+        """PAT attenuation, no SpO₂ drop, no valid HR baseline → PAT (unclassified)."""
+        # hr_baseline=-1 forces hr_rise=0.0 via the guard in _update_derived
+        buf = self._recovering_buffers([96.0] * 20, hr_baseline=-1.0)
+        with buf.lock:
+            buf._update_derived()
+        self.assertEqual(len(buf.pat_events), 1)
+        self.assertEqual(buf.pat_events[0][4], watchpat_gui.EVT_PAT)
+
+    # ------------------------------------------------------------------
+    # AHI / RDI counting
+    # ------------------------------------------------------------------
+
+    def test_pahi_counts_apnea_and_hypopnea_only(self):
+        """pAHI = (APNEA+HYPOPNEA)/hr; pRDI adds RERA; EVT_PAT excluded."""
+        buf = watchpat_gui.SensorBuffers()
+        now = time.time()
+        with buf.lock:
+            buf.start_time = now - 3600  # 1-hour session
+            buf.pat_events = [
+                (100.0, 0.5, 5.0, 5.0, watchpat_gui.EVT_APNEA),
+                (200.0, 0.5, 5.0, 5.0, watchpat_gui.EVT_APNEA),
+                (300.0, 0.5, 5.0, 5.0, watchpat_gui.EVT_APNEA),
+                (400.0, 0.5, 5.0, 3.5, watchpat_gui.EVT_HYPOPNEA),
+                (500.0, 0.5, 5.0, 3.5, watchpat_gui.EVT_HYPOPNEA),
+                (600.0, 0.5, 9.0, 1.0, watchpat_gui.EVT_RERA),
+                (700.0, 0.5, 9.0, 1.0, watchpat_gui.EVT_RERA),
+                (800.0, 0.5, 1.0, 0.5, watchpat_gui.EVT_PAT),
+            ]
+            buf._update_derived()
+        # 3 APNEA + 2 HYPOPNEA = 5 events over 1 hour
+        self.assertAlmostEqual(buf.pahi_estimate, 5.0, places=1)
+        # + 2 RERA = 7 events
+        self.assertAlmostEqual(buf.rdi_estimate, 7.0, places=1)
+
+    def test_pat_event_shorter_than_ten_seconds_is_not_counted(self):
+        """PAT attenuations under 10 s should terminate without creating an event."""
+        buf = self._recovering_buffers([96.0] * 20, hr_baseline=60.0,
+                                       event_duration_s=9.0)
+        with buf.lock:
+            buf._update_derived()
+        self.assertEqual(buf.pat_events, [])
+        self.assertFalse(buf._pat_in_event)
+
+    # ------------------------------------------------------------------
+    # Central apnea detection
+    # ------------------------------------------------------------------
+
+    def _central_buffers(self, has_concurrent_pat):
+        """Buffers set up with an ODI3 event recovering at session time 100 s.
+
+        Seeding _spo2_raw and _spo2_ema makes _update_derived produce a
+        positive current_spo2 (≈95.5) even with empty oxi channels, so the
+        ODI3 detection block runs.  The baseline is 96.0, giving drop ≈0.5
+        which is <1.0 and triggers recovery.
+        """
+        buf = watchpat_gui.SensorBuffers()
+        now = time.time()
+        with buf.lock:
+            buf.start_time = now - 3600
+            buf._spo2_raw.extend([95.5] * 14)
+            buf._spo2_ema = 95.5
+            buf._desat_in_event = True
+            buf._desat_start_elapsed = 100.0
+            buf._desat_nadir = 91.0
+            buf._desat_baseline.extend([96.0] * 50)
+            if has_concurrent_pat:
+                buf.pat_events = [
+                    (100.0, 0.5, 8.0, 4.5, watchpat_gui.EVT_APNEA)]
+        return buf
+
+    def test_central_detected_without_concurrent_pat(self):
+        """SpO₂ drop with no nearby PAT event → added to central_events."""
+        buf = self._central_buffers(has_concurrent_pat=False)
+        with buf.lock:
+            buf._update_derived()
+        self.assertEqual(len(buf.central_events), 1)
+        self.assertAlmostEqual(buf.central_events[0][0], 100.0, places=0)
+
+    def test_central_not_detected_with_concurrent_pat(self):
+        """SpO₂ drop coinciding with a PAT event → NOT classified as central."""
+        buf = self._central_buffers(has_concurrent_pat=True)
+        with buf.lock:
+            buf._update_derived()
+        self.assertEqual(len(buf.central_events), 0)
+
+    def test_central_not_detected_during_active_pat_event(self):
+        """An active PAT event suppresses central classification immediately."""
+        buf = self._central_buffers(has_concurrent_pat=False)
+        with buf.lock:
+            buf._pat_in_event = True
+            buf._update_derived()
+        self.assertEqual(len(buf.central_events), 0)
 
 
 if __name__ == "__main__":
