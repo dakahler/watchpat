@@ -22,6 +22,7 @@ import threading
 import time
 from collections import deque
 from queue import Queue, Empty
+from typing import Optional
 
 import matplotlib
 
@@ -48,9 +49,11 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.gridspec import GridSpec
+from matplotlib.widgets import Button, Slider
 import numpy as np
 
 from watchpat_ble import (
+    HEADER_SIZE,
     WatchPATClient, ParsedDataPacket, DecodedWaveform,
     MotionRecord, MetricRecord, RecordKind,
     read_dat_file, parse_data_packet, format_parsed_packet,
@@ -275,11 +278,13 @@ class SensorBuffers:
         self.central_events: list = []  # (elapsed_sec, spo2_drop) — SpO₂ without PAT
         self.rdi_estimate = -1.0        # pRDI = (APNEA + HYPOPNEA + RERA) / hr
 
-    def feed(self, pkt: ParsedDataPacket):
+    def feed(self, pkt: ParsedDataPacket, now: float = None):
         """Ingest a parsed data packet into the rolling buffers."""
         with self.lock:
+            if now is None:
+                now = time.time()
             if self.start_time is None:
-                self.start_time = time.time()
+                self.start_time = now
             self.packet_count += 1
             self.total_bytes += len(pkt.raw_payload)
 
@@ -311,13 +316,14 @@ class SensorBuffers:
                     f"#{self.packet_count}: {ev.kind.name} val={ev.value}")
 
             # Compute derived HR/SpO2 at ~1 Hz
-            now = time.time()
             if now - self._last_derive_time >= DERIVE_INTERVAL:
                 self._last_derive_time = now
-                self._update_derived()
+                self._update_derived(now=now)
 
-    def _update_derived(self):
+    def _update_derived(self, now: float = None):
         """Compute heart rate and SpO2 from current raw buffers (called with lock held)."""
+        if now is None:
+            now = time.time()
         # Try PAT first, then OxiB, then OxiA for heart rate
         hr = -1.0
         for buf in (self.pat, self.oxi_b, self.oxi_a):
@@ -388,7 +394,7 @@ class SensorBuffers:
             self.spo2_history.append(float("nan"))
 
         # ---- ODI3 apnea event detection ----
-        elapsed = time.time() - self.start_time if self.start_time else 0.0
+        elapsed = now - self.start_time if self.start_time else 0.0
         if self.current_spo2 > 0:
             self.spo2_full_history.append(self.current_spo2)
             self.spo2_full_times.append(elapsed)
@@ -530,6 +536,68 @@ class SensorBuffers:
             }
 
 
+def _normalize_replay_payload(raw: bytes) -> bytes:
+    """Accept either a payload-only capture record or a full BLE packet."""
+    if len(raw) >= HEADER_SIZE and raw[:2] == b"\xBB\xBB":
+        return raw[HEADER_SIZE:]
+    return raw
+
+
+class ReplayController:
+    """Owns replay state so the GUI can seek and scrub arbitrarily."""
+
+    def __init__(self, path: str, speed: float = 1.0):
+        self.path = path
+        self.speed = speed
+        self._playhead = 0.0
+        self._paused = speed <= 0
+        self.packets: list[ParsedDataPacket] = []
+        for idx, raw in enumerate(read_dat_file(path)):
+            payload = _normalize_replay_payload(raw)
+            self.packets.append(parse_data_packet(payload, idx))
+        self.buffers = SensorBuffers()
+        self.current_index = 0
+        if speed <= 0 and self.packets:
+            self.seek(len(self.packets))
+
+    @property
+    def packet_count(self) -> int:
+        return len(self.packets)
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def toggle_paused(self):
+        self._paused = not self._paused
+        return self._paused
+
+    def seek(self, target_index: int):
+        target_index = max(0, min(int(target_index), self.packet_count))
+        new_buffers = SensorBuffers()
+        for idx in range(target_index):
+            new_buffers.feed(self.packets[idx], now=float(idx + 1))
+        self.buffers = new_buffers
+        self.current_index = target_index
+        self._playhead = float(target_index)
+        return self.buffers
+
+    def advance(self, packets_per_second: float):
+        if self._paused or self.packet_count == 0 or packets_per_second <= 0:
+            return self.buffers
+        self._playhead = min(self.packet_count, self._playhead + packets_per_second)
+        target_index = int(self._playhead)
+        while self.current_index < target_index:
+            self.buffers.feed(
+                self.packets[self.current_index],
+                now=float(self.current_index + 1),
+            )
+            self.current_index += 1
+        if self.current_index >= self.packet_count:
+            self._paused = True
+        return self.buffers
+
+
 # ---------------------------------------------------------------------------
 # Dashboard figure
 # ---------------------------------------------------------------------------
@@ -540,6 +608,11 @@ class WatchPATDashboard:
         self.buffers = buffers
         self.anim = None
         self._closing = False
+        self.replay_controller: Optional[ReplayController] = None
+        self.replay_slider = None
+        self.replay_button = None
+        self.replay_status_text = None
+        self._ignore_slider_change = False
         self._build_figure()
 
     def _build_figure(self):
@@ -792,8 +865,96 @@ class WatchPATDashboard:
         if callable(protocol):
             protocol("WM_DELETE_WINDOW", self.request_close)
 
+    def enable_replay_scrubber(self, controller: ReplayController):
+        """Attach replay controls for seeking through preloaded data."""
+        self.replay_controller = controller
+        self.buffers = controller.buffers
+        self.fig.subplots_adjust(bottom=0.10)
+
+        dark_bg = "#16213e"
+        text_color = "#e0e0e0"
+        slider_ax = self.fig.add_axes([0.10, 0.02, 0.70, 0.03], facecolor=dark_bg)
+        button_ax = self.fig.add_axes([0.82, 0.018, 0.08, 0.04])
+        status_ax = self.fig.add_axes([0.91, 0.016, 0.07, 0.05], facecolor="none")
+        status_ax.axis("off")
+
+        max_packet = max(controller.packet_count, 1)
+        self.replay_slider = Slider(
+            slider_ax,
+            "Replay",
+            0,
+            max_packet,
+            valinit=controller.current_index,
+            valstep=1,
+            color="#3498db",
+            dragging=False,
+        )
+        self.replay_slider.label.set_color(text_color)
+        self.replay_slider.valtext.set_color(text_color)
+        self.replay_button = Button(
+            button_ax,
+            "Pause" if not controller.paused else "Play",
+            color="#2a2a4a",
+            hovercolor="#3a3a5a",
+        )
+        self.replay_status_text = status_ax.text(
+            0.5, 0.5, "",
+            ha="center", va="center", fontsize=9, color=text_color,
+            transform=status_ax.transAxes,
+        )
+
+        def _on_slider_change(val):
+            if self._ignore_slider_change:
+                return
+            controller.seek(int(val))
+            self.buffers = controller.buffers
+            if self.fig.canvas:
+                self.fig.canvas.draw_idle()
+
+        def _on_button(_event):
+            paused = controller.toggle_paused()
+            self.replay_button.label.set_text("Play" if paused else "Pause")
+            if self.fig.canvas:
+                self.fig.canvas.draw_idle()
+
+        self.replay_slider.on_changed(_on_slider_change)
+        self.replay_button.on_clicked(_on_button)
+        self._sync_replay_controls()
+
+    def _sync_replay_controls(self):
+        if not self.replay_controller:
+            return
+        ctrl = self.replay_controller
+        if self.replay_slider is not None:
+            self._ignore_slider_change = True
+            self.replay_slider.set_val(ctrl.current_index)
+            self._ignore_slider_change = False
+        if self.replay_button is not None:
+            self.replay_button.label.set_text("Play" if ctrl.paused else "Pause")
+        if self.replay_status_text is not None:
+            total = max(ctrl.packet_count, 1)
+            cur_min = ctrl.current_index / 60.0
+            total_min = ctrl.packet_count / 60.0
+            self.replay_status_text.set_text(
+                f"{cur_min:.1f}/{total_min:.1f}m\n{ctrl.current_index}/{total}"
+            )
+
+    def _reset_event_lines(self):
+        for lines in self._evt_lines.values():
+            for line in lines:
+                line.remove()
+            lines.clear()
+        for evt_type in self._drawn_evt_count:
+            self._drawn_evt_count[evt_type] = 0
+
     def update(self, frame):
         """Animation update callback."""
+        if self.replay_controller is not None:
+            packets_per_second = (self.replay_controller.speed
+                                  if self.replay_controller.speed > 0 else 0.0)
+            self.replay_controller.advance(packets_per_second / FPS)
+            self.buffers = self.replay_controller.buffers
+            self._sync_replay_controls()
         snap = self.buffers.snapshot()
 
         # -- Update waveforms --
@@ -928,38 +1089,31 @@ class WatchPATDashboard:
         else:
             self.pat_amp_line.set_data([], [])
 
-        # PAT events: draw new markers per type (incremental)
-        pat_events = snap["pat_events"]
-        drawn = self._drawn_evt_count
-        n_new_pat = len(pat_events) - drawn[EVT_APNEA] - drawn[EVT_HYPOPNEA] \
-                    - drawn[EVT_RERA] - drawn[EVT_PAT]
-        if n_new_pat > 0:
-            already_drawn = sum(drawn[t] for t in [EVT_APNEA, EVT_HYPOPNEA,
-                                                    EVT_RERA, EVT_PAT])
-            for ev_time, _, _, _, evt_type in pat_events[already_drawn:]:
-                color = EVENT_COLORS.get(evt_type, "#95a5a6")
-                vl = self.ax_apnea.axvline(
-                    x=ev_time / 60.0, color=color, alpha=0.75, linewidth=1.5)
-                self._evt_lines[evt_type].append(vl)
-                self._drawn_evt_count[evt_type] += 1
+        self._reset_event_lines()
 
-        # Central apnea markers (purple) — incremental
+        # PAT events: draw current markers per type
+        pat_events = snap["pat_events"]
+        for ev_time, _, _, _, evt_type in pat_events:
+            color = EVENT_COLORS.get(evt_type, "#95a5a6")
+            vl = self.ax_apnea.axvline(
+                x=ev_time / 60.0, color=color, alpha=0.75, linewidth=1.5)
+            self._evt_lines[evt_type].append(vl)
+            self._drawn_evt_count[evt_type] += 1
+
+        # Central apnea markers (purple)
         central_events = snap["central_events"]
-        n_new_central = len(central_events) - drawn[EVT_CENTRAL]
-        if n_new_central > 0:
-            for ev_time, _ in central_events[drawn[EVT_CENTRAL]:]:
-                vl = self.ax_apnea.axvline(
-                    x=ev_time / 60.0, color=EVENT_COLORS[EVT_CENTRAL],
-                    alpha=0.75, linewidth=1.5)
-                self._evt_lines[EVT_CENTRAL].append(vl)
-                self._drawn_evt_count[EVT_CENTRAL] += 1
+        for ev_time, _ in central_events:
+            vl = self.ax_apnea.axvline(
+                x=ev_time / 60.0, color=EVENT_COLORS[EVT_CENTRAL],
+                alpha=0.75, linewidth=1.5)
+            self._evt_lines[EVT_CENTRAL].append(vl)
+            self._drawn_evt_count[EVT_CENTRAL] += 1
 
         # AHI/RDI text
         pahi = snap["pahi_estimate"]
         rdi  = snap["rdi_estimate"]
         ahi  = snap["ahi_estimate"]
         n_central = len(central_events)
-        counts = {t: drawn[t] for t in EVENT_COLORS}  # snapshot of drawn counts
         primary = pahi if pahi >= 0 else ahi
         if primary >= 0:
             n_a = self._drawn_evt_count[EVT_APNEA]
@@ -1062,7 +1216,7 @@ def replay_feeder(path: str, buffers: SensorBuffers, speed: float = 1.0,
     for idx, raw in enumerate(read_dat_file(path)):
         if stop_event and stop_event.is_set():
             break
-        pkt = parse_data_packet(raw, idx)
+        pkt = parse_data_packet(_normalize_replay_payload(raw), idx)
         buffers.feed(pkt)
         # Each packet ≈ 1 second of data
         if speed > 0:
@@ -1185,14 +1339,14 @@ Examples:
     buffers = SensorBuffers()
     stop_event = threading.Event()
     dashboard = WatchPATDashboard(buffers)
+    replay_controller = None
 
     if args.replay:
         dashboard.set_mode_label(f"Replay: {args.replay}  ({args.speed}x)")
-        t = threading.Thread(
-            target=replay_feeder,
-            args=(args.replay, buffers, args.speed, stop_event),
-            daemon=True,
-        )
+        replay_controller = ReplayController(args.replay, args.speed)
+        dashboard.enable_replay_scrubber(replay_controller)
+        dashboard.buffers = replay_controller.buffers
+        t = None
     else:
         out = args.output
         if not out:
@@ -1207,7 +1361,8 @@ Examples:
             daemon=True,
         )
 
-    t.start()
+    if t is not None:
+        t.start()
 
     try:
         dashboard.run()  # Blocks until window closed
@@ -1215,8 +1370,9 @@ Examples:
         pass
     finally:
         stop_event.set()
-        t.join(timeout=1.5)
-        snap = buffers.snapshot()
+        if t is not None:
+            t.join(timeout=1.5)
+        snap = dashboard.buffers.snapshot()
         print(f"\nSession summary: {snap['packet_count']} packets, "
               f"{snap['total_bytes']/1024:.1f} KB")
 

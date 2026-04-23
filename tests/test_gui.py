@@ -116,6 +116,59 @@ class TestWatchPATDashboard(unittest.TestCase):
                     expected_color,
                 )
 
+    def test_replay_scrubber_seek_updates_dashboard_buffer(self):
+        controller = mock.Mock()
+        controller.buffers = watchpat_gui.SensorBuffers()
+        controller.current_index = 3
+        controller.packet_count = 10
+        controller.paused = True
+        controller.speed = 1.0
+        controller.seek = mock.Mock(return_value=controller.buffers)
+        controller.advance = mock.Mock(return_value=controller.buffers)
+
+        self.dashboard.enable_replay_scrubber(controller)
+        self.dashboard.replay_slider.set_val(5)
+
+        controller.seek.assert_called_with(5)
+        self.assertIs(self.dashboard.buffers, controller.buffers)
+
+    def test_replay_update_advances_controller_and_syncs_slider(self):
+        controller = mock.Mock()
+        controller.buffers = self.buffers
+        controller.current_index = 4
+        controller.packet_count = 12
+        controller.paused = False
+        controller.speed = 2.0
+        controller.advance = mock.Mock(return_value=self.buffers)
+
+        self.dashboard.enable_replay_scrubber(controller)
+        artists = self.dashboard.update(frame=0)
+
+        controller.advance.assert_called_once()
+        self.assertEqual(self.dashboard.replay_slider.val, 4)
+        self.assertGreater(len(artists), 0)
+
+    def test_event_markers_reset_when_scrubbing_backwards(self):
+        with self.buffers.lock:
+            self.buffers.start_time = time.time() - 3600
+            self.buffers.spo2_full_times.extend([60.0])
+            self.buffers.spo2_full_history.extend([95.0])
+            self.buffers.pat_events = [
+                (60.0, 0.5, 8.0, 4.2, watchpat_gui.EVT_APNEA),
+                (120.0, 0.6, 4.0, 3.2, watchpat_gui.EVT_HYPOPNEA),
+            ]
+        self.dashboard.update(frame=0)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_APNEA], 1)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_HYPOPNEA], 1)
+
+        with self.buffers.lock:
+            self.buffers.pat_events = [
+                (60.0, 0.5, 8.0, 4.2, watchpat_gui.EVT_APNEA),
+            ]
+        self.dashboard.update(frame=0)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_APNEA], 1)
+        self.assertEqual(self.dashboard._drawn_evt_count[watchpat_gui.EVT_HYPOPNEA], 0)
+
     def test_request_close_stops_animation_once(self):
         stop = mock.Mock()
         self.dashboard.anim = mock.Mock(event_source=mock.Mock(stop=stop))
@@ -164,6 +217,45 @@ class TestBleFeeder(unittest.TestCase):
         self.assertEqual(fake.scan_args[1], "SER123")
         self.assertIs(fake.scan_args[2], stop_event)
         fake.connect.assert_not_awaited()
+
+
+class TestReplayController(unittest.TestCase):
+    def test_seek_rebuilds_buffers_to_requested_packet(self):
+        packet_a = mock.Mock(raw_payload=b"a", waveforms=[], motion=None,
+                             metric=None, events=[])
+        packet_b = mock.Mock(raw_payload=b"bb", waveforms=[], motion=None,
+                             metric=None, events=[])
+
+        with mock.patch.object(watchpat_gui, "read_dat_file", return_value=[b"a", b"b"]):
+            with mock.patch.object(watchpat_gui, "parse_data_packet",
+                                   side_effect=[packet_a, packet_b]):
+                ctrl = watchpat_gui.ReplayController("capture.dat", speed=1.0)
+
+        ctrl.seek(1)
+        self.assertEqual(ctrl.current_index, 1)
+        self.assertEqual(ctrl.buffers.packet_count, 1)
+        self.assertEqual(ctrl.buffers.total_bytes, 1)
+
+        ctrl.seek(2)
+        self.assertEqual(ctrl.current_index, 2)
+        self.assertEqual(ctrl.buffers.packet_count, 2)
+        self.assertEqual(ctrl.buffers.total_bytes, 3)
+
+    def test_advance_feeds_packets_until_target_index(self):
+        packet_a = mock.Mock(raw_payload=b"a", waveforms=[], motion=None,
+                             metric=None, events=[])
+        packet_b = mock.Mock(raw_payload=b"bb", waveforms=[], motion=None,
+                             metric=None, events=[])
+
+        with mock.patch.object(watchpat_gui, "read_dat_file", return_value=[b"a", b"b"]):
+            with mock.patch.object(watchpat_gui, "parse_data_packet",
+                                   side_effect=[packet_a, packet_b]):
+                ctrl = watchpat_gui.ReplayController("capture.dat", speed=2.0)
+
+        ctrl.advance(2.0)
+        self.assertEqual(ctrl.current_index, 2)
+        self.assertEqual(ctrl.buffers.packet_count, 2)
+        self.assertTrue(ctrl.paused)
 
 
 class TestApneaClassification(unittest.TestCase):
