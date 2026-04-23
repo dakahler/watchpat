@@ -20,6 +20,8 @@ The BLE protocol and binary data format were reverse-engineered from the WatchPA
 - **Live GUI dashboard** with rolling waveform plots, body position indicator, accelerometer view, and session stats
 - **Raw capture** to length-prefixed `.dat` files for offline analysis
 - **Offline replay** and **CSV export** of all decoded channels
+- **Estimated sleep-event metrics** including ODI-style `AHI`, PAT-based `pAHI`, `pRDI`, and central-event counts during replay/analysis
+- **Capture comparison tool** for diffing two `.dat` files and reporting metric deltas such as `AHI` / `pAHI`
 
 ## Requirements
 
@@ -95,7 +97,24 @@ python watchpat_ble.py --replay capture.dat --csv output_prefix
 # Replay with GUI dashboard
 python watchpat_gui.py --replay capture.dat
 python watchpat_gui.py --replay capture.dat --speed 10  # 10x speed
+
+# Compare two captures
+python watchpat_diff.py baseline.dat followup.dat
+python watchpat_diff.py baseline.dat followup.dat --json
 ```
+
+### AHI and Related Metrics
+
+During replay and offline analysis the project derives a few sleep-event estimates from the raw WatchPAT signals:
+
+- `AHI` is an ODI-style estimate based on SpO2 desaturation events (drop >= 3% for >= 10 s).
+- `pAHI` is a PAT-based estimate that counts `APNEA` and `HYPOPNEA` events per hour.
+- `pRDI` extends `pAHI` by also counting `RERA` events per hour.
+- `Central` events are desaturations with no nearby PAT attenuation and are tracked separately.
+
+These values appear in the GUI replay dashboard session stats, and `watchpat_diff.py` reports the summary for two recordings side by side with deltas.
+
+The AHI-related values here are heuristic estimates derived from reverse-engineered signal processing in this repo. They are useful for comparing captures and validating pipeline behavior, but they are not a substitute for the vendor software or a clinical scoring workflow.
 
 ## Tests
 
@@ -226,6 +245,7 @@ The Android app implements the same NUS protocol as the Python client. Key imple
 |------|-------------|
 | `watchpat_ble.py` | BLE client, protocol implementation, data decoding, CLI |
 | `watchpat_gui.py` | Real-time matplotlib dashboard |
+| `watchpat_diff.py` | Offline comparator for two `.dat` captures, including AHI/pAHI/pRDI deltas |
 | `watchpat_to_resmed_sd.py` | Export tool for ResMed SD card format |
 | `build_apk.py` | Build the Android debug APK |
 | `install_apk.py` | Install the APK via USB (adb) |
