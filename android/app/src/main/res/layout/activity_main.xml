@@ -141,4 +141,18 @@
 
     </LinearLayout>
 
+    <Button
+        android:id="@+id/btn_analyze"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/btn_analyze"
+        android:layout_marginTop="4dp" />
+
+    <Button
+        android:id="@+id/btn_mqtt_config"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/btn_mqtt_config"
+        android:layout_marginTop="4dp" />
+
 </LinearLayout>

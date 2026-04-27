@@ -20,8 +20,28 @@ from enum import IntEnum
 from io import BytesIO
 from typing import Optional, Callable
 
-from bleak import BleakClient, BleakScanner
-from bleak.backends.device import BLEDevice
+from watchpat_protocol import (
+    WatchpatPacket,
+    KaitaiStream,
+    BytesIO as KaiBytesIO,
+    ValidationNotEqualError,
+    parse_data_payload,
+    crc16_watchpat,
+    verify_crc,
+    decode_byte_delta_waveform as _decode_byte_delta,
+    decode_nibble_delta_waveform as _decode_nibble_delta,
+    motion_subframe_crc_valid,
+)
+
+try:
+    from bleak import BleakClient, BleakScanner
+    from bleak.backends.device import BLEDevice
+    _BLEAK_AVAILABLE = True
+except ImportError:
+    BleakClient = None
+    BleakScanner = None
+    BLEDevice = None
+    _BLEAK_AVAILABLE = False
 
 logger = logging.getLogger("watchpat")
 
@@ -338,139 +358,36 @@ class ParsedDataPacket:
 
 
 # ---------------------------------------------------------------------------
-# CRC-16 (CCITT variant used by WatchPAT)
-# ---------------------------------------------------------------------------
-def crc16_watchpat(data: bytes) -> int:
-    """CRC-16 with polynomial 0x1021, init 0xFFFF, bit-by-bit."""
-    crc = 0xFFFF
-    for byte in data:
-        mask = 0x80
-        while mask > 0:
-            carry = (crc & 0x8000) != 0
-            if (byte & mask) != 0:
-                carry = not carry
-            crc = (crc << 1) & 0xFFFF
-            if carry:
-                crc ^= 0x1021
-            mask >>= 1
-    return crc & 0xFFFF
-
-
-# ---------------------------------------------------------------------------
 # Logical record parsing & waveform decoding
+# (crc16_watchpat and verify_crc imported from watchpat_protocol)
 # ---------------------------------------------------------------------------
-
-def _zigzag_decode_8(b: int) -> int:
-    """Decode a zigzag-encoded unsigned byte to signed value."""
-    return (b >> 1) ^ -(b & 1)
-
-
-def _signed_nibble(n: int) -> int:
-    """Decode a 4-bit unsigned nibble as signed (-8..+7)."""
-    return n - 16 if n >= 8 else n
-
 
 def decode_byte_delta_waveform(payload: bytes, record_hdr: LogicalRecordHeader) -> DecodedWaveform:
-    """Decode 01/11, 02/11, or 03/11 waveform records.
-
-    Baseline codec: 2-byte LE seed + zigzag8 first-order deltas.
-    Long packets may contain widened tokens (unresolved exact rule),
-    so we decode baseline bytes only — widened tokens produce approximate values.
-    """
+    """Decode 01/11, 02/11, or 03/11 waveform records into a DecodedWaveform."""
+    samples = _decode_byte_delta(payload)
     wf = DecodedWaveform(
         kind=record_hdr.kind,
         rate=record_hdr.rate,
         flags=record_hdr.flags,
         raw_payload=bytes(payload),
+        seed=samples[0] if samples else 0,
+        samples=samples,
     )
-    if len(payload) < 2:
-        return wf
-
-    wf.seed = struct.unpack_from("<h", payload, 0)[0]  # signed 16-bit LE
-    samples = [wf.seed]
-    acc = wf.seed
-
-    body = payload[2:]
-    if len(body) == 100:
-        # Baseline packet — pure zigzag byte deltas
-        for b in body:
-            acc += _zigzag_decode_8(b)
-            samples.append(acc)
-    else:
-        # Long or short packet — best-effort decode treating every byte as
-        # a zigzag delta. Widened tokens will be approximate but the signal
-        # shape is preserved well enough for display.
-        for b in body:
-            acc += _zigzag_decode_8(b)
-            samples.append(acc)
-
-    wf.samples = samples
     return wf
 
 
 def decode_nibble_delta_waveform(payload: bytes, record_hdr: LogicalRecordHeader) -> DecodedWaveform:
-    """Decode 04/01 chest-sensor waveform.
-
-    Baseline codec: 2-byte LE seed, skip 1 body byte, then each remaining
-    byte contributes: low nibble = signed 4-bit delta, high nibble 0 or 7
-    means emit one extra repeated sample.
-    """
+    """Decode 04/01 chest-sensor waveform into a DecodedWaveform."""
+    samples = _decode_nibble_delta(payload)
     wf = DecodedWaveform(
         kind=record_hdr.kind,
         rate=record_hdr.rate,
         flags=record_hdr.flags,
         raw_payload=bytes(payload),
+        seed=samples[0] if samples else 0,
+        samples=samples,
     )
-    if len(payload) < 3:
-        return wf
-
-    wf.seed = struct.unpack_from("<h", payload, 0)[0]
-    samples = [wf.seed]
-    acc = wf.seed
-
-    body = payload[3:]  # skip 1 body byte after 2-byte seed
-    for b in body:
-        lo = b & 0x0F
-        hi = (b >> 4) & 0x0F
-        delta = _signed_nibble(lo)
-        acc += delta
-        samples.append(acc)
-        if hi == 0 or hi == 7:
-            samples.append(acc)  # extra repeated sample
-
-    wf.samples = samples
     return wf
-
-
-def decode_motion_record(payload: bytes, record_hdr: LogicalRecordHeader) -> MotionRecord:
-    """Decode 06/00 motion summary — five 16-byte subframes.
-
-    Each subframe:  dd dd a3 57  field_a:u16le  field_b:u16le
-                    x:i16le  y:i16le  z:i16le  crc16:u16le
-    """
-    mr = MotionRecord(
-        rate=record_hdr.rate,
-        flags=record_hdr.flags,
-        raw_payload=bytes(payload),
-    )
-    for i in range(0, len(payload) - 15, 16):
-        chunk = payload[i:i + 16]
-        marker = struct.unpack_from("<I", chunk, 0)[0]
-        if marker != 0x57A3DDDD:
-            # Not a valid subframe marker
-            continue
-        fa = struct.unpack_from("<H", chunk, 4)[0]
-        fb = struct.unpack_from("<H", chunk, 6)[0]
-        x = struct.unpack_from("<h", chunk, 8)[0]
-        y = struct.unpack_from("<h", chunk, 10)[0]
-        z = struct.unpack_from("<h", chunk, 12)[0]
-        stored_crc = struct.unpack_from("<H", chunk, 14)[0]
-        computed_crc = crc16_watchpat(bytes(chunk[:14]))
-        mr.subframes.append(MotionSubframe(
-            field_a=fa, field_b=fb, x=x, y=y, z=z,
-            crc_valid=(stored_crc == computed_crc),
-        ))
-    return mr
 
 
 def decode_metric_record(payload: bytes, record_hdr: LogicalRecordHeader) -> MetricRecord:
@@ -490,65 +407,47 @@ def decode_event_record(payload: bytes, record_hdr: LogicalRecordHeader) -> Even
 
 
 def parse_logical_records(data: bytes) -> list:
-    """Parse all logical records from a DATA_PACKET payload.
+    """Parse all logical records from a DATA_PACKET payload via Kaitai."""
+    try:
+        dp = parse_data_payload(data)
+    except Exception as e:
+        logger.debug("parse_logical_records: %s", e)
+        return []
 
-    Each record starts with 0xAAAA sync word followed by a 12-byte header,
-    then payload_len bytes of record data.
-    """
     records = []
-    pos = 0
-    while pos + RECORD_HEADER_SIZE <= len(data):
-        # Scan for sync word
-        if pos + 2 > len(data):
-            break
-        sync = struct.unpack_from("<H", data, pos)[0]
-        if sync != RECORD_SYNC:
-            pos += 1
-            continue
-
-        if pos + RECORD_HEADER_SIZE > len(data):
-            break
-
-        record_id = data[pos + 2]
-        record_type = data[pos + 3]
-        payload_len = struct.unpack_from("<H", data, pos + 4)[0]
-        rate = struct.unpack_from("<H", data, pos + 6)[0]
-        flags = struct.unpack_from("<I", data, pos + 8)[0]
-
-        kind = RecordKind.from_id_type(record_id, record_type)
+    for rec in dp.records:
+        kind_val = (rec.record_id << 8) | rec.record_type
+        kind = RecordKind.from_id_type(rec.record_id, rec.record_type)
         hdr = LogicalRecordHeader(
-            record_id=record_id,
-            record_type=record_type,
-            payload_len=payload_len,
-            rate=rate,
-            flags=flags,
+            record_id=rec.record_id,
+            record_type=rec.record_type,
+            payload_len=rec.payload_len,
+            rate=rec.rate,
+            flags=rec.flags,
             kind=kind,
         )
+        raw = rec._raw_payload
 
-        payload_start = pos + RECORD_HEADER_SIZE
-        payload_end = payload_start + payload_len
-        if payload_end > len(data):
-            logger.debug("Truncated record %02x/%02x at offset %d", record_id, record_type, pos)
-            break
-
-        rec_payload = data[payload_start:payload_end]
-
-        # Decode based on record kind
-        if kind in (RecordKind.WAVEFORM_01_11, RecordKind.WAVEFORM_02_11,
-                     RecordKind.WAVEFORM_03_11):
-            records.append(("waveform", hdr, decode_byte_delta_waveform(rec_payload, hdr)))
-        elif kind == RecordKind.WAVEFORM_04_01:
-            records.append(("waveform", hdr, decode_nibble_delta_waveform(rec_payload, hdr)))
-        elif kind == RecordKind.METRIC_05_10:
-            records.append(("metric", hdr, decode_metric_record(rec_payload, hdr)))
-        elif kind == RecordKind.MOTION_06_00:
-            records.append(("motion", hdr, decode_motion_record(rec_payload, hdr)))
-        elif kind in (RecordKind.EVENT_0C_00, RecordKind.EVENT_0D_00):
-            records.append(("event", hdr, decode_event_record(rec_payload, hdr)))
+        if kind_val in (RecordKind.WAVEFORM_01_11, RecordKind.WAVEFORM_02_11,
+                         RecordKind.WAVEFORM_03_11):
+            records.append(("waveform", hdr, decode_byte_delta_waveform(raw, hdr)))
+        elif kind_val == RecordKind.WAVEFORM_04_01:
+            records.append(("waveform", hdr, decode_nibble_delta_waveform(raw, hdr)))
+        elif kind_val == RecordKind.METRIC_05_10:
+            records.append(("metric", hdr, decode_metric_record(raw, hdr)))
+        elif kind_val == RecordKind.MOTION_06_00:
+            mr = MotionRecord(rate=hdr.rate, flags=hdr.flags, raw_payload=raw)
+            for sf in rec.payload.subframes:
+                mr.subframes.append(MotionSubframe(
+                    field_a=sf.field_a, field_b=sf.field_b,
+                    x=sf.x, y=sf.y, z=sf.z,
+                    crc_valid=motion_subframe_crc_valid(sf),
+                ))
+            records.append(("motion", hdr, mr))
+        elif kind_val in (RecordKind.EVENT_0C_00, RecordKind.EVENT_0D_00):
+            records.append(("event", hdr, decode_event_record(raw, hdr)))
         else:
-            records.append(("unknown", hdr, bytes(rec_payload)))
-
-        pos = payload_end
+            records.append(("unknown", hdr, raw))
 
     return records
 
@@ -709,60 +608,57 @@ def parse_header(data: bytes) -> dict:
     }
 
 
-def verify_crc(data: bytes) -> bool:
-    """Verify CRC of a received packet."""
-    if len(data) < HEADER_SIZE:
-        return False
-    packet = bytearray(data)
-    stored_crc = struct.unpack_from("<H", packet, 22)[0]
-    packet[22] = 0
-    packet[23] = 0
-    computed = crc16_watchpat(bytes(packet))
-    # The device stores CRC as Short.reverseBytes of the computed value
-    computed_reversed = ((computed >> 8) & 0xFF) | ((computed & 0xFF) << 8)
-    return stored_crc == computed_reversed or stored_crc == computed
-
-
 def parse_tech_status(payload: bytes) -> TechStatus:
-    """Parse technical status payload (10 bytes)."""
+    """Parse technical status payload via Kaitai TechStatusPayload."""
     ts = TechStatus()
-    if len(payload) >= 10:
-        ts.battery_voltage = (payload[1] << 1) | payload[0]
-        ts.vdd_voltage = (payload[3] << 1) | payload[2]
-        ts.ir_led = (payload[5] << 1) | payload[4]
-        ts.red_led = (payload[7] << 1) | payload[6]
-        ts.pat_led = payload[8] | (payload[9] << 1)
+    try:
+        tp = WatchpatPacket.TechStatusPayload(
+            KaitaiStream(KaiBytesIO(payload)), None, None
+        )
+        ts.battery_voltage = tp.battery_voltage
+        ts.vdd_voltage = tp.vdd_voltage
+        ts.ir_led = tp.ir_led
+        ts.red_led = tp.red_led
+        ts.pat_led = tp.pat_led
+    except Exception:
+        pass
     return ts
 
 
 def parse_device_config(payload: bytes) -> DeviceConfig:
-    """Parse device configuration from SESSION_CONFIRM or CONFIG_RESPONSE."""
+    """Parse device configuration via Kaitai SessionConfirmPayload."""
     cfg = DeviceConfig()
     cfg.raw = bytes(payload)
-    if len(payload) >= 4:
-        cfg.hw_major = payload[0]
-        cfg.hw_minor = payload[1]
-        cfg.fw_version = struct.unpack_from("<H", payload, 2)[0]
-    if len(payload) >= 58:
-        cfg.serial_number = struct.unpack_from("<I", payload, 54)[0]
-    if len(payload) >= 236:
-        subtype = payload[235]
-        cfg.device_subtype = subtype
-        cfg.is_wcp_less = (subtype & 0x55) != 0
-        cfg.is_wp1m = (subtype & 0x02) != 0
-        cfg.has_finger_detection = (subtype & 0x08) != 0
-    if len(payload) >= 223:
-        pin_raw = payload[221] | (payload[222] << 8)
-        cfg.pin_code = f"{pin_raw:04d}"
+    try:
+        scp = WatchpatPacket.SessionConfirmPayload(
+            KaitaiStream(KaiBytesIO(payload)), None, None
+        )
+        cfg.hw_major = scp.hw_major or 0
+        cfg.hw_minor = scp.hw_minor or 0
+        cfg.fw_version = scp.fw_version or 0
+        if scp.serial_number is not None:
+            cfg.serial_number = scp.serial_number
+        if scp.pin_code_raw is not None:
+            cfg.pin_code = f"{scp.pin_code_raw:04d}"
+        if scp.device_subtype is not None:
+            cfg.device_subtype = scp.device_subtype
+            cfg.is_wcp_less = scp.is_wcp_less or False
+            cfg.is_wp1m = scp.is_wp1m or False
+            cfg.has_finger_detection = scp.has_finger_detection or False
+    except Exception:
+        pass
     return cfg
 
 
 def parse_bit_response(payload: bytes) -> BITResult:
-    """Parse BIT response (4 bytes, little-endian int — Java reverses bytes)."""
-    if len(payload) >= 4:
-        val = struct.unpack_from("<I", payload, 0)[0]
-        return BITResult(raw_value=val)
-    return BITResult()
+    """Parse BIT response via Kaitai BitResponsePayload."""
+    try:
+        bp = WatchpatPacket.BitResponsePayload(
+            KaitaiStream(KaiBytesIO(payload)), None, None
+        )
+        return BITResult(raw_value=bp.raw_flags)
+    except Exception:
+        return BITResult()
 
 
 # ---------------------------------------------------------------------------
@@ -855,8 +751,11 @@ class WatchPATClient:
     # -- Scanning ----------------------------------------------------------
 
     @staticmethod
-    async def scan(timeout: float = 10.0, serial_filter: str = "") -> list[BLEDevice]:
+    async def scan(timeout: float = 10.0, serial_filter: str = "",
+                   stop_event=None, check_interval: float = 0.1) -> list:
         """Scan for WatchPAT devices. They advertise as 'ITAMAR_XXXXXXX'."""
+        if not _BLEAK_AVAILABLE:
+            raise RuntimeError("bleak is not installed. Run: pip install bleak")
         found = {}  # address -> device
 
         def detection_callback(device, adv_data):
@@ -875,8 +774,15 @@ class WatchPATClient:
 
         scanner = BleakScanner(detection_callback=detection_callback)
         await scanner.start()
-        await asyncio.sleep(timeout)
-        await scanner.stop()
+        try:
+            if stop_event is None:
+                await asyncio.sleep(timeout)
+            else:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline and not stop_event.is_set():
+                    await asyncio.sleep(check_interval)
+        finally:
+            await scanner.stop()
         return list(found.values())
 
     # -- Connection --------------------------------------------------------

@@ -1,0 +1,6 @@
+bleak
+kaitaistruct
+matplotlib
+numpy
+pytest
+paho-mqtt

@@ -20,16 +20,32 @@ The BLE protocol and binary data format were reverse-engineered from the WatchPA
 - **Live GUI dashboard** with rolling waveform plots, body position indicator, accelerometer view, and session stats
 - **Raw capture** to length-prefixed `.dat` files for offline analysis
 - **Offline replay** and **CSV export** of all decoded channels
+- **Estimated sleep-event metrics** including ODI-style `AHI`, PAT-based `pAHI`, `pRDI`, and central-event counts during replay/analysis
+- **Capture comparison tool** for diffing two `.dat` files and reporting metric deltas such as `AHI` / `pAHI`
+- **MQTT summary publishing** for final analysis results, with Home Assistant MQTT Discovery support
 
 ## Requirements
 
 - Python 3.10+
+- `kaitaistruct` — runtime needed by the generated packet parser
 - [bleak](https://github.com/hbldh/bleak) — BLE client library
 - [matplotlib](https://matplotlib.org/) — dashboard GUI
 - [numpy](https://numpy.org/) — numerical arrays for plotting
 
+Install everything with:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
 ```
-pip install bleak matplotlib numpy
+
+If you already have the repo virtualenv, run commands with `.venv/bin/python`.
+
+Minimal manual install:
+
+```
+pip install bleak kaitaistruct matplotlib numpy pytest paho-mqtt
 ```
 
 ## Usage
@@ -66,6 +82,7 @@ python watchpat_ble.py --serial XXXXXXXXX --monitor --duration 60 -o capture.dat
 ### Live capture (GUI dashboard)
 
 ```bash
+python watchpat_gui.py                         # live auto-detect
 python watchpat_gui.py --serial XXXXXXXXX
 ```
 
@@ -81,7 +98,47 @@ python watchpat_ble.py --replay capture.dat --csv output_prefix
 # Replay with GUI dashboard
 python watchpat_gui.py --replay capture.dat
 python watchpat_gui.py --replay capture.dat --speed 10  # 10x speed
+
+# Compare two captures
+python watchpat_diff.py baseline.dat followup.dat
+python watchpat_diff.py baseline.dat followup.dat --json
+
+# Publish a retained MQTT summary from a capture and verify broker round-trip
+python watchpat_mqtt_test.py --input-dat tests/testdata2.dat --server 192.168.1.150 --username watchpat --password watchpat1 --retain
 ```
+
+### AHI and Related Metrics
+
+During replay and offline analysis the project derives a few sleep-event estimates from the raw WatchPAT signals:
+
+- `AHI` is an ODI-style estimate based on SpO2 desaturation events (drop >= 3% for >= 10 s).
+- `pAHI` is a PAT-based estimate that counts `APNEA` and `HYPOPNEA` events per hour.
+- `pRDI` extends `pAHI` by also counting `RERA` events per hour.
+- `Central` events are desaturations with no nearby PAT attenuation and are tracked separately.
+
+These values appear in the GUI replay dashboard session stats, and `watchpat_diff.py` reports the summary for two recordings side by side with deltas.
+
+The AHI-related values here are heuristic estimates derived from reverse-engineered signal processing in this repo. They are useful for comparing captures and validating pipeline behavior, but they are not a substitute for the vendor software or a clinical scoring workflow.
+
+### MQTT and Home Assistant
+
+The project can publish final analysis summaries over MQTT as a single JSON payload containing values such as `AHI`, `pAHI`, `pRDI`, mean/min `SpO2`, heart-rate stats, and event counts.
+
+- `watchpat_mqtt_test.py` is a Python integration check which analyzes a `.dat` file, publishes the final summary to MQTT, and verifies the broker echoes the retained payload back.
+- By default the test script publishes state to `watchpat/analysis/test` and publishes Home Assistant MQTT Discovery config under the `homeassistant/` prefix.
+- The Android app publishes retained summary state to `watchpat/analysis` and also publishes Home Assistant MQTT Discovery config automatically.
+
+If Home Assistant MQTT Discovery is enabled and connected to the same broker, the published discovery config should create entities automatically for summary metrics like `AHI`, `pAHI`, `pRDI`, mean `SpO2`, and mean heart rate.
+
+## Tests
+
+```bash
+python tests/test_protocol.py
+python tests/test_gui.py
+python tests/test_mqtt_payload.py
+```
+
+The GUI tests are headless and validate dashboard update/close behavior without opening a real desktop window.
 
 ## Protocol Overview
 
@@ -126,7 +183,7 @@ Each `DATA_PACKET` (opcode `0x0800`) payload contains multiple logical records, 
 | `05/10` | 1 Hz | Derived metric | 4-byte signed LE int |
 | `06/00` | 5 Hz | SBP motion/orientation | 5x 16-byte CRC'd subframes |
 | `0C/00` | rare | Event code | 2-byte LE value |
-| `0D/00` | rare | Event payload | 20 raw bytes |
+| `0D/00` | rare | Event payload | raw bytes |
 
 ### Motion Subframe (06/00)
 
@@ -152,7 +209,7 @@ Capture `.dat` files use a simple length-prefixed format for easy replay:
 [4-byte LE length][payload bytes][4-byte LE length][payload bytes]...
 ```
 
-Each payload is one complete `DATA_PACKET` containing ~1 second of sensor data across all channels.
+Each stored payload is the `DATA_PACKET` body only, meaning the bytes after the 24-byte BLE packet header. Each payload contains about 1 second of sensor data across all channels.
 
 ## Android App
 
@@ -166,14 +223,14 @@ A standalone Android recorder app is included in the `android/` directory. It co
 
 ### Build and install
 
-```bat
-build_apk.bat       # compiles watchpat-debug.apk
-install_apk.bat     # adb installs and launches on connected phone
+```bash
+python build_apk.py
+python install_apk.py
 ```
 
 Both scripts require:
 - [Android SDK](https://developer.android.com/studio) with `platform-tools` (for `adb`)
-- JDK 17 or 21 — set `JAVA_HOME` inside `build_apk.bat` if the path differs from the default
+- JDK 17 or 21. `build_apk.py` will use `JAVA_HOME` if set and otherwise tries common system locations.
 
 The Gradle wrapper (`android/gradlew`) is included in the repo.
 
@@ -185,9 +242,28 @@ The Gradle wrapper (`android/gradlew`) is included in the repo.
 4. **Wait ~40 seconds** — the device has a firmware warmup period before it begins streaming data packets
 5. Record as long as needed; packet count increments every 10 packets
 6. Tap **Stop Recording**
-7. Tap **Share File** to export the `.dat` file via email, Drive, or any other app
+7. The app runs its Python-based analysis on the finished recording and can publish the final summary to MQTT
+8. Tap **Share File** to export the `.dat` file via email, Drive, or any other app
 
 Recordings are saved to app-specific external storage and are not accessible via the phone's file manager — use the Share button or USB transfer.
+
+### MQTT summary publishing
+
+The Android app includes an **MQTT Config** screen where you can set:
+
+- MQTT server URI or host
+- Optional MQTT username
+- Optional MQTT password
+
+When a recording analysis completes, the app publishes one retained JSON summary to:
+
+- `watchpat/analysis`
+
+It also publishes retained Home Assistant MQTT Discovery config topics under:
+
+- `homeassistant/sensor/watchpat_android_summary/.../config`
+
+This allows Home Assistant to create MQTT entities automatically if MQTT Discovery is enabled.
 
 ### Protocol notes
 
@@ -203,9 +279,12 @@ The Android app implements the same NUS protocol as the Python client. Key imple
 |------|-------------|
 | `watchpat_ble.py` | BLE client, protocol implementation, data decoding, CLI |
 | `watchpat_gui.py` | Real-time matplotlib dashboard |
+| `watchpat_diff.py` | Offline comparator for two `.dat` captures, including AHI/pAHI/pRDI deltas |
+| `watchpat_mqtt_test.py` | MQTT integration verifier for retained analysis summary publishing |
 | `watchpat_to_resmed_sd.py` | Export tool for ResMed SD card format |
-| `build_apk.bat` | Build the Android debug APK |
-| `install_apk.bat` | Install the APK via USB (adb) |
+| `build_apk.py` | Build the Android debug APK |
+| `install_apk.py` | Install the APK via USB (adb) |
+| `tests/` | Protocol and headless GUI test coverage |
 | `android/` | Android Studio project (Java, API 21+) |
 
 ## Disclaimer

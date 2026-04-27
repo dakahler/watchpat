@@ -15,22 +15,45 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import struct
 import sys
 import threading
 import time
 from collections import deque
 from queue import Queue, Empty
+from typing import Optional
 
 import matplotlib
-matplotlib.use("TkAgg")
+
+
+def _configure_matplotlib_backend():
+    """Prefer a native interactive backend and avoid forcing Tk on macOS."""
+    backend_logger = logging.getLogger("watchpat.gui")
+    if os.environ.get("MPLBACKEND"):
+        return
+    preferred = ["MacOSX", "TkAgg"] if sys.platform == "darwin" else ["TkAgg"]
+    for backend in preferred:
+        try:
+            matplotlib.use(backend)
+            backend_logger.info("Using matplotlib backend: %s", backend)
+            return
+        except Exception:
+            backend_logger.debug(
+                "Matplotlib backend %s unavailable", backend, exc_info=True
+            )
+
+
+_configure_matplotlib_backend()
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.gridspec import GridSpec
+from matplotlib.widgets import Button, Slider
 import numpy as np
 
 from watchpat_ble import (
+    HEADER_SIZE,
     WatchPATClient, ParsedDataPacket, DecodedWaveform,
     MotionRecord, MetricRecord, RecordKind,
     read_dat_file, parse_data_packet, format_parsed_packet,
@@ -38,326 +61,90 @@ from watchpat_ble import (
 
 logger = logging.getLogger("watchpat.gui")
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-WINDOW_SECONDS = 10        # Rolling window width
-WAVEFORM_RATE = 100        # Nominal sample rate for waveform channels
-MOTION_RATE = 5            # Subframes per second
-BUFFER_SIZE = WINDOW_SECONDS * WAVEFORM_RATE  # 1000 samples
-MOTION_BUFFER = WINDOW_SECONDS * MOTION_RATE  # 50 samples
-FPS = 15                   # GUI refresh rate
-DERIVED_HISTORY = 120      # Seconds of HR/SpO2 trend to display
-DERIVE_INTERVAL = 1.0      # Seconds between derived signal updates
+from watchpat_analysis import (
+    WINDOW_SECONDS, WAVEFORM_RATE, MOTION_RATE, BUFFER_SIZE, MOTION_BUFFER,
+    DERIVED_HISTORY, DERIVE_INTERVAL, POSITION_LABELS,
+    EVT_APNEA, EVT_HYPOPNEA, EVT_RERA, EVT_PAT, EVT_CENTRAL,
+    SensorBuffers,
+)
+
+FPS = 15
 
 CHANNEL_COLORS = {
-    "OxiA":  "#e74c3c",    # Red
-    "OxiB":  "#3498db",    # Blue
-    "PAT":   "#2ecc71",    # Green
-    "Chest": "#f39c12",    # Orange
+    "OxiA":  "#e74c3c",
+    "OxiB":  "#3498db",
+    "PAT":   "#2ecc71",
+    "Chest": "#f39c12",
 }
 
-POSITION_LABELS = {
-    "z+": "Supine",
-    "z-": "Prone",
-    "y+": "Left",
-    "y-": "Right",
-    "x+": "Upright",
-    "x-": "Inverted",
+EVENT_COLORS = {
+    EVT_APNEA:    "#e74c3c",
+    EVT_HYPOPNEA: "#e67e22",
+    EVT_RERA:     "#f1c40f",
+    EVT_PAT:      "#95a5a6",
+    EVT_CENTRAL:  "#9b59b6",
 }
 
-
-# ---------------------------------------------------------------------------
-# Real-time derived signal computation (adapted from watchpat_to_resmed_sd)
-# ---------------------------------------------------------------------------
-
-def _detect_peaks_rt(samples: np.ndarray, rate: int) -> list[int]:
-    """Detect pulse peaks in a waveform buffer. Returns peak indices."""
-    if len(samples) < rate * 3:
-        return []
-    # Baseline removal via moving average (~0.75 Hz window)
-    win = max(3, int(rate * 0.75))
-    kernel = np.ones(win) / win
-    baseline = np.convolve(samples, kernel, mode="same")
-    detrended = samples - baseline
-
-    abs_median = float(np.median(np.abs(detrended)))
-    threshold = max(20.0, abs_median * 1.5)
-    refractory = max(1, int(rate * 0.35))
-    prom_win = max(3, int(rate * 0.15))
-
-    peaks: list[int] = []
-    last_peak = -refractory
-    for i in range(1, len(detrended) - 1):
-        if i - last_peak < refractory:
-            continue
-        c = detrended[i]
-        if c <= threshold:
-            continue
-        if c <= detrended[i - 1] or c < detrended[i + 1]:
-            continue
-        lo = max(0, i - prom_win)
-        hi = min(len(detrended), i + prom_win + 1)
-        local_min = float(np.min(detrended[lo:hi]))
-        if (c - local_min) < threshold * 1.2:
-            continue
-        peaks.append(i)
-        last_peak = i
-    return peaks
+def _normalize_replay_payload(raw: bytes) -> bytes:
+    """Accept either a payload-only capture record or a full BLE packet."""
+    if len(raw) >= HEADER_SIZE and raw[:2] == b"\xBB\xBB":
+        return raw[HEADER_SIZE:]
+    return raw
 
 
-def _compute_heart_rate(samples: np.ndarray, rate: int) -> float:
-    """Compute heart rate (BPM) from a waveform buffer. Returns -1 on failure."""
-    peaks = _detect_peaks_rt(samples, rate)
-    if len(peaks) < 3:
-        return -1.0
-    # Compute BPM from plausible inter-peak intervals
-    bpms = []
-    min_ivl = rate * 60.0 / 140.0
-    max_ivl = rate * 60.0 / 40.0
-    for a, b in zip(peaks, peaks[1:]):
-        delta = b - a
-        if min_ivl <= delta <= max_ivl:
-            bpms.append(60.0 * rate / delta)
-    if len(bpms) < 2:
-        return -1.0
-    return float(np.median(bpms))
+class ReplayController:
+    """Owns replay state so the GUI can seek and scrub arbitrarily."""
 
+    def __init__(self, path: str, speed: float = 1.0):
+        self.path = path
+        self.speed = speed
+        self._playhead = 0.0
+        self._paused = speed <= 0
+        self.packets: list[ParsedDataPacket] = []
+        for idx, raw in enumerate(read_dat_file(path)):
+            payload = _normalize_replay_payload(raw)
+            self.packets.append(parse_data_packet(payload, idx))
+        self.buffers = SensorBuffers()
+        self.current_index = 0
+        if speed <= 0 and self.packets:
+            self.seek(len(self.packets))
 
-def _sinusoid_amplitude(samples: np.ndarray, hz: float, rate: int) -> float:
-    """Amplitude of a sinusoid at frequency hz via single-bin DFT."""
-    if len(samples) == 0 or hz <= 0:
-        return 0.0
-    mean_val = float(np.mean(samples))
-    n = np.arange(len(samples))
-    angle = 2.0 * math.pi * hz * n / rate
-    centered = samples - mean_val
-    real_part = float(np.sum(centered * np.cos(angle)))
-    imag_part = float(-np.sum(centered * np.sin(angle)))
-    return (2.0 / len(samples)) * math.sqrt(real_part**2 + imag_part**2)
+    @property
+    def packet_count(self) -> int:
+        return len(self.packets)
 
+    @property
+    def paused(self) -> bool:
+        return self._paused
 
-def _compute_spo2_pair(red: np.ndarray, ir: np.ndarray, bpm: float,
-                       rate: int) -> tuple[float, float]:
-    """Compute SpO2 from a specific red/IR assignment using a 4-second window.
-    Returns (spo2, ratio) or (-1, -1) on failure."""
-    # Use a 4-second window from the tail, matching the batch converter
-    n = min(len(red), len(ir), rate * 4)
-    if n < rate * 2:
-        return -1.0, -1.0
-    red_win = red[-n:]
-    ir_win = ir[-n:]
+    def toggle_paused(self):
+        self._paused = not self._paused
+        return self._paused
 
-    red_dc = float(np.mean(red_win))
-    ir_dc = float(np.mean(ir_win))
-    # Reject when DC is near zero (delta-encoded baseline crossing zero)
-    if abs(red_dc) < 10.0 or abs(ir_dc) < 10.0:
-        return -1.0, -1.0
+    def seek(self, target_index: int):
+        target_index = max(0, min(int(target_index), self.packet_count))
+        new_buffers = SensorBuffers()
+        for idx in range(target_index):
+            new_buffers.feed(self.packets[idx], now=float(idx + 1))
+        self.buffers = new_buffers
+        self.current_index = target_index
+        self._playhead = float(target_index)
+        return self.buffers
 
-    pulse_hz = bpm / 60.0
-    red_ac = _sinusoid_amplitude(red_win, pulse_hz, rate)
-    ir_ac = _sinusoid_amplitude(ir_win, pulse_hz, rate)
-    if red_ac <= 0 or ir_ac <= 0:
-        return -1.0, -1.0
-
-    # AC/DC modulation depth — reject if AC is implausibly large vs DC
-    if red_ac / abs(red_dc) > 0.5 or ir_ac / abs(ir_dc) > 0.5:
-        return -1.0, -1.0
-
-    ratio = abs((red_ac / red_dc) / (ir_ac / ir_dc))
-    spo2 = 116.0 - 25.0 * ratio
-    if 60.0 <= spo2 <= 100.0:
-        return spo2, ratio
-    return -1.0, ratio
-
-
-# ---------------------------------------------------------------------------
-# Data buffer — thread-safe accumulator for incoming parsed packets
-# ---------------------------------------------------------------------------
-class SensorBuffers:
-    """Thread-safe rolling buffers for all sensor channels."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        # Waveform rolling buffers (values)
-        self.oxi_a = deque(maxlen=BUFFER_SIZE)
-        self.oxi_b = deque(maxlen=BUFFER_SIZE)
-        self.pat = deque(maxlen=BUFFER_SIZE)
-        self.chest = deque(maxlen=BUFFER_SIZE)
-
-        # Motion rolling buffers
-        self.accel_x = deque(maxlen=MOTION_BUFFER)
-        self.accel_y = deque(maxlen=MOTION_BUFFER)
-        self.accel_z = deque(maxlen=MOTION_BUFFER)
-        self.field_a = deque(maxlen=MOTION_BUFFER)
-        self.field_b = deque(maxlen=MOTION_BUFFER)
-
-        # Derived signals (1 Hz history)
-        self.hr_history = deque(maxlen=DERIVED_HISTORY)
-        self.spo2_history = deque(maxlen=DERIVED_HISTORY)
-        self.current_hr = -1.0
-        self.current_spo2 = -1.0
-        self._last_derive_time = 0.0
-        # SpO2 assignment tracking: decaying scores (recent performance)
-        self._spo2_score_ab = 0.0   # OxiA=red, OxiB=IR
-        self._spo2_score_ba = 0.0   # OxiB=red, OxiA=IR
-        # Raw SpO2 values before smoothing
-        self._spo2_raw = deque(maxlen=15)
-        self._spo2_ema = -1.0  # exponential moving average
-
-        # Scalar state
-        self.body_position = "?"
-        self.body_position_label = "Unknown"
-        self.metric_value = 0
-        self.packet_count = 0
-        self.total_bytes = 0
-        self.start_time = None
-        self.last_motion_crc_ok = 0
-        self.last_motion_crc_total = 0
-        self.events = deque(maxlen=20)
-
-    def feed(self, pkt: ParsedDataPacket):
-        """Ingest a parsed data packet into the rolling buffers."""
-        with self.lock:
-            if self.start_time is None:
-                self.start_time = time.time()
-            self.packet_count += 1
-            self.total_bytes += len(pkt.raw_payload)
-
-            for wf in pkt.waveforms:
-                buf = self._waveform_buf(wf.channel_name)
-                if buf is not None:
-                    buf.extend(wf.samples)
-
-            if pkt.motion is not None:
-                m = pkt.motion
-                for sf in m.subframes:
-                    self.accel_x.append(sf.x)
-                    self.accel_y.append(sf.y)
-                    self.accel_z.append(sf.z)
-                    self.field_a.append(sf.field_a)
-                    self.field_b.append(sf.field_b)
-                self.body_position = m.body_position
-                self.body_position_label = POSITION_LABELS.get(
-                    m.body_position, m.body_position)
-                ok = sum(1 for sf in m.subframes if sf.crc_valid)
-                self.last_motion_crc_ok = ok
-                self.last_motion_crc_total = len(m.subframes)
-
-            if pkt.metric is not None:
-                self.metric_value = pkt.metric.value
-
-            for ev in pkt.events:
-                self.events.append(
-                    f"#{self.packet_count}: {ev.kind.name} val={ev.value}")
-
-            # Compute derived HR/SpO2 at ~1 Hz
-            now = time.time()
-            if now - self._last_derive_time >= DERIVE_INTERVAL:
-                self._last_derive_time = now
-                self._update_derived()
-
-    def _update_derived(self):
-        """Compute heart rate and SpO2 from current raw buffers (called with lock held)."""
-        # Try PAT first, then OxiB, then OxiA for heart rate
-        hr = -1.0
-        for buf in (self.pat, self.oxi_b, self.oxi_a):
-            if len(buf) >= WAVEFORM_RATE * 5:
-                hr = _compute_heart_rate(np.array(buf), WAVEFORM_RATE)
-                if hr > 0:
-                    break
-        self.current_hr = hr
-        self.hr_history.append(hr if hr > 0 else float("nan"))
-
-        # SpO2: 4s window, decaying assignment scores, median-smooth output
-        spo2 = -1.0
-        min_samples = WAVEFORM_RATE * 4
-        if hr > 0 and len(self.oxi_a) >= min_samples and len(self.oxi_b) >= min_samples:
-            a_arr = np.array(self.oxi_a)
-            b_arr = np.array(self.oxi_b)
-
-            # Quality gate: reject when channels are nearly identical
-            # (device sending duplicate data = no real Red/IR separation)
-            n_check = min(len(a_arr), len(b_arr), WAVEFORM_RATE * 4)
-            a_tail = a_arr[-n_check:]
-            b_tail = b_arr[-n_check:]
-            dc_a, dc_b = float(np.mean(a_tail)), float(np.mean(b_tail))
-            if abs(dc_a) > 10 and abs(dc_b) > 10:
-                dc_ratio = dc_a / dc_b
-            else:
-                dc_ratio = 1.0  # can't determine → treat as invalid
-            # Channels are distinct when DC ratio is far from 1.0
-            # (real Red/IR typically have very different baselines)
-            channels_distinct = abs(dc_ratio - 1.0) > 0.08
-
-            if channels_distinct:
-                # Compute both assignments
-                spo2_ab, ratio_ab = _compute_spo2_pair(
-                    a_arr, b_arr, hr, WAVEFORM_RATE)
-                spo2_ba, ratio_ba = _compute_spo2_pair(
-                    b_arr, a_arr, hr, WAVEFORM_RATE)
-                # Decay old scores, then reward plausible ratios
-                self._spo2_score_ab *= 0.9
-                self._spo2_score_ba *= 0.9
-                if spo2_ab > 0 and ratio_ab > 0 and 0.4 <= ratio_ab <= 1.3:
-                    self._spo2_score_ab += 1.0 - abs(ratio_ab - 0.7)
-                if spo2_ba > 0 and ratio_ba > 0 and 0.4 <= ratio_ba <= 1.3:
-                    self._spo2_score_ba += 1.0 - abs(ratio_ba - 0.7)
-                # Pick assignment with better recent score
-                if self._spo2_score_ab >= self._spo2_score_ba:
-                    spo2 = spo2_ab if spo2_ab > 0 else spo2_ba
-                else:
-                    spo2 = spo2_ba if spo2_ba > 0 else spo2_ab
-
-        # Heavy smoothing: median filter + outlier rejection + EMA
-        self._spo2_raw.append(spo2)
-        valid_raw = sorted([v for v in self._spo2_raw if v > 0])
-        if valid_raw:
-            # Trimmed median: drop top/bottom 20% before taking median
-            trim = max(1, len(valid_raw) // 5)
-            trimmed = valid_raw[trim:-trim] if len(valid_raw) > 4 else valid_raw
-            med = trimmed[len(trimmed) // 2]
-            # EMA for further smoothing (alpha=0.15 → ~7s time constant)
-            if self._spo2_ema < 0:
-                self._spo2_ema = med
-            else:
-                self._spo2_ema += 0.15 * (med - self._spo2_ema)
-            self.current_spo2 = self._spo2_ema
-            self.spo2_history.append(self._spo2_ema)
-        else:
-            self.current_spo2 = -1.0
-            self.spo2_history.append(float("nan"))
-
-    def _waveform_buf(self, name: str):
-        return {"OxiA": self.oxi_a, "OxiB": self.oxi_b,
-                "PAT": self.pat, "Chest": self.chest}.get(name)
-
-    def snapshot(self):
-        """Return a consistent snapshot of all buffers for rendering."""
-        with self.lock:
-            return {
-                "oxi_a": np.array(self.oxi_a) if self.oxi_a else np.array([]),
-                "oxi_b": np.array(self.oxi_b) if self.oxi_b else np.array([]),
-                "pat": np.array(self.pat) if self.pat else np.array([]),
-                "chest": np.array(self.chest) if self.chest else np.array([]),
-                "accel_x": np.array(self.accel_x) if self.accel_x else np.array([]),
-                "accel_y": np.array(self.accel_y) if self.accel_y else np.array([]),
-                "accel_z": np.array(self.accel_z) if self.accel_z else np.array([]),
-                "field_a": np.array(self.field_a) if self.field_a else np.array([]),
-                "field_b": np.array(self.field_b) if self.field_b else np.array([]),
-                "hr_history": np.array(self.hr_history) if self.hr_history else np.array([]),
-                "spo2_history": np.array(self.spo2_history) if self.spo2_history else np.array([]),
-                "current_hr": self.current_hr,
-                "current_spo2": self.current_spo2,
-                "body_position": self.body_position,
-                "body_position_label": self.body_position_label,
-                "metric": self.metric_value,
-                "packet_count": self.packet_count,
-                "total_bytes": self.total_bytes,
-                "start_time": self.start_time,
-                "motion_crc": (self.last_motion_crc_ok, self.last_motion_crc_total),
-                "events": list(self.events),
-            }
+    def advance(self, packets_per_second: float):
+        if self._paused or self.packet_count == 0 or packets_per_second <= 0:
+            return self.buffers
+        self._playhead = min(self.packet_count, self._playhead + packets_per_second)
+        target_index = int(self._playhead)
+        while self.current_index < target_index:
+            self.buffers.feed(
+                self.packets[self.current_index],
+                now=float(self.current_index + 1),
+            )
+            self.current_index += 1
+        if self.current_index >= self.packet_count:
+            self._paused = True
+        return self.buffers
 
 
 # ---------------------------------------------------------------------------
@@ -368,22 +155,30 @@ class WatchPATDashboard:
 
     def __init__(self, buffers: SensorBuffers):
         self.buffers = buffers
+        self.anim = None
+        self._closing = False
+        self.replay_controller: Optional[ReplayController] = None
+        self.replay_slider = None
+        self.replay_button = None
+        self.replay_status_text = None
+        self._ignore_slider_change = False
         self._build_figure()
 
     def _build_figure(self):
         self.fig = plt.figure(
-            figsize=(16, 11),
+            figsize=(16, 13),
             facecolor="#1a1a2e",
         )
         self.fig.canvas.manager.set_window_title("WatchPAT ONE Dashboard")
 
-        # Layout: 6 rows x 5 cols
-        # Left (cols 0-2): OxiA, OxiB, PAT, Chest, Heart Rate, SpO2
-        # Right (cols 3-4): HR readout, SpO2 readout, Body Pos, Accel, Session
+        # Layout: 7 rows x 5 cols
+        # Left (cols 0-2, rows 0-5): OxiA, OxiB, PAT, Chest, Heart Rate, SpO2
+        # Right (cols 3-4, rows 0-5): HR readout, SpO2 readout, Body Pos, Accel, Session
+        # Full width (row 6): Apnea Events Timeline
         gs = GridSpec(
-            6, 5, figure=self.fig,
+            7, 5, figure=self.fig,
             left=0.06, right=0.98, top=0.94, bottom=0.04,
-            hspace=0.40, wspace=0.4,
+            hspace=0.45, wspace=0.4,
         )
 
         dark_bg = "#16213e"
@@ -557,8 +352,158 @@ class WatchPATDashboard:
             color="#95a5a6",
         )
 
+        # -- Apnea / PAT Events Timeline (row 6, full width) --
+        self.ax_apnea = self.fig.add_subplot(gs[6, :])
+        self.ax_apnea.set_facecolor(dark_bg)
+        self.ax_apnea.set_title(
+            "Apnea Events  —  orange: PAT attenuation ≥30%  |  red: SpO₂ drop ≥3%",
+            color=text_color, fontsize=9, fontweight="bold", loc="left", pad=4)
+        self.ax_apnea.tick_params(colors=text_color, labelsize=7)
+        self.ax_apnea.spines["top"].set_visible(False)
+        for spine in self.ax_apnea.spines.values():
+            spine.set_color(grid_color)
+        self.ax_apnea.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
+        self.ax_apnea.set_ylim(80, 102)
+        self.ax_apnea.set_xlabel("Elapsed (min)", fontsize=7, color=text_color)
+        self.ax_apnea.set_ylabel("SpO₂ (%)", fontsize=7, color="#3498db")
+        self.ax_apnea.tick_params(axis="y", colors="#3498db")
+        self.ax_apnea.set_title(
+            "Apnea Events  —  "
+            "■ Apnea  ■ Hypopnea  ■ RERA  ■ Central (no PAT)",
+            color=text_color, fontsize=9, fontweight="bold", loc="left", pad=4)
+        self.spo2_full_line, = self.ax_apnea.plot(
+            [], [], color="#3498db", linewidth=1.0)
+        # Colored legend squares drawn as text spans
+        _legend_x = [0.01, 0.09, 0.19, 0.25]
+        for xpos, color in zip(_legend_x,
+                                [EVENT_COLORS[EVT_APNEA],
+                                 EVENT_COLORS[EVT_HYPOPNEA],
+                                 EVENT_COLORS[EVT_RERA],
+                                 EVENT_COLORS[EVT_CENTRAL]]):
+            self.ax_apnea.text(xpos, 0.97, "■", ha="left", va="top",
+                               color=color, fontsize=9,
+                               transform=self.ax_apnea.transAxes)
+        # Per-type event line tracking (incremental, never removed)
+        self._evt_lines: dict[str, list] = {t: [] for t in EVENT_COLORS}
+        self._drawn_evt_count: dict[str, int] = {t: 0 for t in EVENT_COLORS}
+
+        # Secondary y-axis: PAT amplitude as % of rolling baseline
+        self.ax_pat_amp = self.ax_apnea.twinx()
+        self.ax_pat_amp.set_facecolor("none")
+        self.ax_pat_amp.set_ylim(0, 150)
+        self.ax_pat_amp.set_ylabel("PAT amp (% baseline)", fontsize=7,
+                                    color="#2ecc71")
+        self.ax_pat_amp.tick_params(axis="y", colors="#2ecc71", labelsize=7)
+        self.ax_pat_amp.spines["right"].set_color("#2ecc71")
+        self.ax_pat_amp.spines["top"].set_visible(False)
+        self.ax_pat_amp.spines["left"].set_visible(False)
+        self.ax_pat_amp.axhline(y=70, color="#f39c12", linewidth=0.8,
+                                 linestyle="--", alpha=0.7)
+        self.pat_amp_line, = self.ax_pat_amp.plot(
+            [], [], color="#2ecc71", linewidth=0.8, alpha=0.85)
+
+        self.ax_apnea_ahi_text = self.ax_apnea.text(
+            0.99, 0.93, "pAHI: --",
+            ha="right", va="top", fontsize=9, fontweight="bold",
+            color="#7f8c8d", transform=self.ax_apnea.transAxes)
+
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+        manager = getattr(self.fig.canvas, "manager", None)
+        window = getattr(manager, "window", None)
+        protocol = getattr(window, "protocol", None)
+        if callable(protocol):
+            protocol("WM_DELETE_WINDOW", self.request_close)
+
+    def enable_replay_scrubber(self, controller: ReplayController):
+        """Attach replay controls for seeking through preloaded data."""
+        self.replay_controller = controller
+        self.buffers = controller.buffers
+        self.fig.subplots_adjust(bottom=0.10)
+
+        dark_bg = "#16213e"
+        text_color = "#e0e0e0"
+        slider_ax = self.fig.add_axes([0.10, 0.02, 0.70, 0.03], facecolor=dark_bg)
+        button_ax = self.fig.add_axes([0.82, 0.018, 0.08, 0.04])
+        status_ax = self.fig.add_axes([0.91, 0.016, 0.07, 0.05], facecolor="none")
+        status_ax.axis("off")
+
+        max_packet = max(controller.packet_count, 1)
+        self.replay_slider = Slider(
+            slider_ax,
+            "Replay",
+            0,
+            max_packet,
+            valinit=controller.current_index,
+            valstep=1,
+            color="#3498db",
+            dragging=False,
+        )
+        self.replay_slider.label.set_color(text_color)
+        self.replay_slider.valtext.set_color(text_color)
+        self.replay_button = Button(
+            button_ax,
+            "Pause" if not controller.paused else "Play",
+            color="#2a2a4a",
+            hovercolor="#3a3a5a",
+        )
+        self.replay_status_text = status_ax.text(
+            0.5, 0.5, "",
+            ha="center", va="center", fontsize=9, color=text_color,
+            transform=status_ax.transAxes,
+        )
+
+        def _on_slider_change(val):
+            if self._ignore_slider_change:
+                return
+            controller.seek(int(val))
+            self.buffers = controller.buffers
+            if self.fig.canvas:
+                self.fig.canvas.draw_idle()
+
+        def _on_button(_event):
+            paused = controller.toggle_paused()
+            self.replay_button.label.set_text("Play" if paused else "Pause")
+            if self.fig.canvas:
+                self.fig.canvas.draw_idle()
+
+        self.replay_slider.on_changed(_on_slider_change)
+        self.replay_button.on_clicked(_on_button)
+        self._sync_replay_controls()
+
+    def _sync_replay_controls(self):
+        if not self.replay_controller:
+            return
+        ctrl = self.replay_controller
+        if self.replay_slider is not None:
+            self._ignore_slider_change = True
+            self.replay_slider.set_val(ctrl.current_index)
+            self._ignore_slider_change = False
+        if self.replay_button is not None:
+            self.replay_button.label.set_text("Play" if ctrl.paused else "Pause")
+        if self.replay_status_text is not None:
+            total = max(ctrl.packet_count, 1)
+            cur_min = ctrl.current_index / 60.0
+            total_min = ctrl.packet_count / 60.0
+            self.replay_status_text.set_text(
+                f"{cur_min:.1f}/{total_min:.1f}m\n{ctrl.current_index}/{total}"
+            )
+
+    def _reset_event_lines(self):
+        for lines in self._evt_lines.values():
+            for line in lines:
+                line.remove()
+            lines.clear()
+        for evt_type in self._drawn_evt_count:
+            self._drawn_evt_count[evt_type] = 0
+
     def update(self, frame):
         """Animation update callback."""
+        if self.replay_controller is not None:
+            packets_per_second = (self.replay_controller.speed
+                                  if self.replay_controller.speed > 0 else 0.0)
+            self.replay_controller.advance(packets_per_second / FPS)
+            self.buffers = self.replay_controller.buffers
+            self._sync_replay_controls()
         snap = self.buffers.snapshot()
 
         # -- Update waveforms --
@@ -668,6 +613,75 @@ class WatchPATDashboard:
         axis_str = f"({pos})" if pos != "?" else ""
         self.pos_label.set_text(axis_str)
 
+        # -- Update apnea / PAT events panel --
+        spo2_times = snap["spo2_full_times"]
+        spo2_full = snap["spo2_full_history"]
+        t_max_min = 1.0
+        if len(spo2_times) > 0:
+            t_min = spo2_times / 60.0
+            t_max_min = max(float(t_min[-1]), 1.0)
+            self.spo2_full_line.set_data(t_min, spo2_full)
+            self.ax_apnea.set_xlim(0, t_max_min)
+            valid_spo2 = spo2_full[~np.isnan(spo2_full)]
+            if len(valid_spo2) > 0:
+                lo = max(60.0, float(np.min(valid_spo2)) - 2)
+                self.ax_apnea.set_ylim(lo, 102)
+        else:
+            self.spo2_full_line.set_data([], [])
+
+        # PAT amplitude trace
+        pat_times = snap["pat_amp_times"]
+        pat_amps = snap["pat_amp_history"]
+        if len(pat_times) > 0:
+            self.pat_amp_line.set_data(pat_times / 60.0, pat_amps)
+            self.ax_pat_amp.set_xlim(0, t_max_min)
+        else:
+            self.pat_amp_line.set_data([], [])
+
+        self._reset_event_lines()
+
+        # PAT events: draw current markers per type
+        pat_events = snap["pat_events"]
+        for ev_time, _, _, _, evt_type in pat_events:
+            color = EVENT_COLORS.get(evt_type, "#95a5a6")
+            vl = self.ax_apnea.axvline(
+                x=ev_time / 60.0, color=color, alpha=0.75, linewidth=1.5)
+            self._evt_lines[evt_type].append(vl)
+            self._drawn_evt_count[evt_type] += 1
+
+        # Central apnea markers (purple)
+        central_events = snap["central_events"]
+        for ev_time, _ in central_events:
+            vl = self.ax_apnea.axvline(
+                x=ev_time / 60.0, color=EVENT_COLORS[EVT_CENTRAL],
+                alpha=0.75, linewidth=1.5)
+            self._evt_lines[EVT_CENTRAL].append(vl)
+            self._drawn_evt_count[EVT_CENTRAL] += 1
+
+        # AHI/RDI text
+        pahi = snap["pahi_estimate"]
+        rdi  = snap["rdi_estimate"]
+        ahi  = snap["ahi_estimate"]
+        n_central = len(central_events)
+        primary = pahi if pahi >= 0 else ahi
+        if primary >= 0:
+            n_a = self._drawn_evt_count[EVT_APNEA]
+            n_h = self._drawn_evt_count[EVT_HYPOPNEA]
+            n_r = self._drawn_evt_count[EVT_RERA]
+            rdi_str = f"{rdi:.1f}" if rdi >= 0 else "--"
+            label = (f"pAHI: {pahi:.1f}/hr  pRDI: {rdi_str}/hr"
+                     f"  (A:{n_a} H:{n_h} R:{n_r} C:{n_central})")
+            self.ax_apnea_ahi_text.set_text(label)
+            if primary < 5:
+                self.ax_apnea_ahi_text.set_color("#2ecc71")
+            elif primary < 15:
+                self.ax_apnea_ahi_text.set_color("#f39c12")
+            else:
+                self.ax_apnea_ahi_text.set_color("#e74c3c")
+        else:
+            self.ax_apnea_ahi_text.set_text("pAHI: --")
+            self.ax_apnea_ahi_text.set_color("#7f8c8d")
+
         # -- Update stats panel --
         elapsed = time.time() - snap["start_time"] if snap["start_time"] else 0
         pkt_rate = (snap["packet_count"] / elapsed) if elapsed > 0 else 0
@@ -678,11 +692,19 @@ class WatchPATDashboard:
         crc_str = f"{crc_ok}/{crc_total}" if crc_total > 0 else "-"
         fa = snap["field_a"][-1] if len(snap["field_a"]) > 0 else 0
         fb = snap["field_b"][-1] if len(snap["field_b"]) > 0 else 0
+        pahi_val = snap["pahi_estimate"]
+        rdi_val  = snap["rdi_estimate"]
+        pahi_str = f"{pahi_val:.1f}" if pahi_val >= 0.0 else "--"
+        rdi_str  = f"{rdi_val:.1f}"  if rdi_val  >= 0.0 else "--"
+        n_central_stat = len(snap["central_events"])
         stats_lines = [
             f"Packets:   {snap['packet_count']:>8d}",
             f"Data:      {kb:>7.1f} KB",
             f"Rate:      {pkt_rate:>7.1f} p/s",
             f"Elapsed:   {mins:>4d}m {secs:02d}s",
+            f"pAHI:      {pahi_str:>5s} /hr",
+            f"pRDI:      {rdi_str:>5s} /hr",
+            f"Central:   {n_central_stat:>8d}",
             f"Metric:    {snap['metric']:>8d}",
             f"Motion:    A={fa} B={fb}",
             f"CRC:       {crc_str:>8s}",
@@ -699,11 +721,29 @@ class WatchPATDashboard:
             self.hr_trend_line, self.spo2_trend_line,
             self.pos_text, self.pos_label,
             self.stats_text,
+            self.spo2_full_line,
+            self.pat_amp_line,
+            self.ax_apnea_ahi_text,
         ])
+        for lines in self._evt_lines.values():
+            artists.extend(lines)
         return artists
 
     def set_mode_label(self, text: str):
         self.mode_text.set_text(text)
+
+    def _on_close(self, _event):
+        self._closing = True
+        if self.anim and self.anim.event_source:
+            self.anim.event_source.stop()
+
+    def request_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        if self.anim and self.anim.event_source:
+            self.anim.event_source.stop()
+        plt.close(self.fig)
 
     def run(self):
         """Start the animation loop (blocks until window closes)."""
@@ -712,6 +752,8 @@ class WatchPATDashboard:
             blit=False, cache_frame_data=False,
         )
         plt.show()
+        if self.anim and self.anim.event_source:
+            self.anim.event_source.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +765,7 @@ def replay_feeder(path: str, buffers: SensorBuffers, speed: float = 1.0,
     for idx, raw in enumerate(read_dat_file(path)):
         if stop_event and stop_event.is_set():
             break
-        pkt = parse_data_packet(raw, idx)
+        pkt = parse_data_packet(_normalize_replay_payload(raw), idx)
         buffers.feed(pkt)
         # Each packet ≈ 1 second of data
         if speed > 0:
@@ -744,7 +786,14 @@ def ble_feeder(serial: str, buffers: SensorBuffers,
         wp = WatchPATClient()
 
         logger.info("Scanning for WatchPAT devices (%0.fs)...", scan_time)
-        devices = await wp.scan(timeout=scan_time, serial_filter=serial)
+        devices = await wp.scan(
+            timeout=scan_time,
+            serial_filter=serial,
+            stop_event=stop_event,
+        )
+        if stop_event and stop_event.is_set():
+            logger.info("BLE feeder stopped during scan.")
+            return
         if not devices:
             logger.error("No WatchPAT devices found.")
             return
@@ -752,6 +801,9 @@ def ble_feeder(serial: str, buffers: SensorBuffers,
         device = devices[0]
         logger.info("Connecting to %s ...", device.name)
         await wp.connect(device)
+        if stop_event and stop_event.is_set():
+            logger.info("BLE feeder stopped before session start.")
+            return
 
         dump_file = None
         if output_path:
@@ -836,14 +888,14 @@ Examples:
     buffers = SensorBuffers()
     stop_event = threading.Event()
     dashboard = WatchPATDashboard(buffers)
+    replay_controller = None
 
     if args.replay:
         dashboard.set_mode_label(f"Replay: {args.replay}  ({args.speed}x)")
-        t = threading.Thread(
-            target=replay_feeder,
-            args=(args.replay, buffers, args.speed, stop_event),
-            daemon=True,
-        )
+        replay_controller = ReplayController(args.replay, args.speed)
+        dashboard.enable_replay_scrubber(replay_controller)
+        dashboard.buffers = replay_controller.buffers
+        t = None
     else:
         out = args.output
         if not out:
@@ -858,7 +910,8 @@ Examples:
             daemon=True,
         )
 
-    t.start()
+    if t is not None:
+        t.start()
 
     try:
         dashboard.run()  # Blocks until window closed
@@ -866,8 +919,9 @@ Examples:
         pass
     finally:
         stop_event.set()
-        t.join(timeout=5)
-        snap = buffers.snapshot()
+        if t is not None:
+            t.join(timeout=1.5)
+        snap = dashboard.buffers.snapshot()
         print(f"\nSession summary: {snap['packet_count']} packets, "
               f"{snap['total_bytes']/1024:.1f} KB")
 

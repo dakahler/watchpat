@@ -1,5 +1,6 @@
 plugins {
     id 'com.android.application'
+    id 'com.chaquo.python'
 }
 
 android {
@@ -12,6 +13,17 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+
+        ndk {
+            abiFilters "arm64-v8a", "x86_64"
+        }
+
+        python {
+            pip {
+                install "numpy"
+                install "kaitaistruct"
+            }
+        }
     }
 
     signingConfigs {
@@ -44,6 +56,14 @@ android {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
+
+    sourceSets {
+        main {
+            // Package only the app-local Python sources. Shared modules copied here
+            // keep Chaquopy from treating the whole repo root as a generated output.
+            python.srcDirs = ["src/main/python"]
+        }
+    }
 }
 
 dependencies {
@@ -51,4 +71,6 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.cardview:cardview:1.0.0'
+    implementation 'io.kaitai:kaitai-struct-runtime:0.10'
+    implementation 'org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5'
 }

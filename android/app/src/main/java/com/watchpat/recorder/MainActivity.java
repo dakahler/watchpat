@@ -3,7 +3,9 @@ package com.watchpat.recorder;
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
@@ -16,6 +18,15 @@ import android.widget.TextView;
 import androidx.core.content.FileProvider;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import com.chaquo.python.PyObject;
+import com.chaquo.python.Python;
+import com.chaquo.python.android.AndroidPlatform;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -28,6 +39,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import org.json.JSONObject;
 
 public class MainActivity extends AppCompatActivity implements WatchPatBleManager.Listener {
 
@@ -40,9 +52,13 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
     private Button btnScan;
     private Button btnRecord;
     private Button btnShare;
+    private Button btnAnalyze;
+    private Button btnMqttConfig;
 
     private WatchPatBleManager bleManager;
     private boolean sessionReady = false; // true after SESSION_CONFIRM received
+
+    private final ExecutorService analysisExecutor = Executors.newSingleThreadExecutor();
 
     private final ActivityResultLauncher<String[]> permissionLauncher =
             registerForActivityResult(
@@ -58,6 +74,13 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
                             appendLog("ERROR: Required permissions denied");
                             tvStatus.setText("Permissions denied — cannot scan");
                         }
+                    });
+
+    private final ActivityResultLauncher<String[]> openFileLauncher =
+            registerForActivityResult(
+                    new ActivityResultContracts.OpenDocument(),
+                    uri -> {
+                        if (uri != null) analyzeFromUri(uri);
                     });
 
     private final ActivityResultLauncher<Intent> enableBluetoothLauncher =
@@ -83,15 +106,24 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
         tvPackets = findViewById(R.id.tv_packets);
         tvLog     = findViewById(R.id.tv_log);
         scrollLog = findViewById(R.id.scroll_log);
-        btnScan   = findViewById(R.id.btn_scan);
-        btnRecord = findViewById(R.id.btn_record);
-        btnShare  = findViewById(R.id.btn_share);
+        btnScan    = findViewById(R.id.btn_scan);
+        btnRecord  = findViewById(R.id.btn_record);
+        btnShare   = findViewById(R.id.btn_share);
+        btnAnalyze = findViewById(R.id.btn_analyze);
+        btnMqttConfig = findViewById(R.id.btn_mqtt_config);
+
+        if (!Python.isStarted()) {
+            Python.start(new AndroidPlatform(this));
+        }
 
         bleManager = new WatchPatBleManager(this, this);
 
         btnScan.setOnClickListener(v -> onScanButtonClicked());
         btnRecord.setOnClickListener(v -> onRecordButtonClicked());
         btnShare.setOnClickListener(v -> onShareButtonClicked());
+        btnAnalyze.setOnClickListener(v -> openFileLauncher.launch(new String[]{"*/*"}));
+        btnMqttConfig.setOnClickListener(v ->
+                startActivity(new Intent(this, MqttConfigActivity.class)));
     }
 
     @Override
@@ -291,6 +323,78 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
         if (path != null) {
             appendLog("File: " + path);
             btnShare.setVisibility(View.VISIBLE);
+            analyzeRecording(path);
+        }
+    }
+
+    private void analyzeRecording(String path) {
+        appendLog("Analyzing recording...");
+        analysisExecutor.execute(() -> {
+            runAnalysisAndPublish(path);
+        });
+    }
+
+    private void analyzeFromUri(android.net.Uri uri) {
+        appendLog("Loading file for analysis...");
+        analysisExecutor.execute(() -> {
+            File tmp = null;
+            try {
+                tmp = File.createTempFile("watchpat_", ".dat", getCacheDir());
+                try (InputStream in = getContentResolver().openInputStream(uri);
+                     FileOutputStream out = new FileOutputStream(tmp)) {
+                    if (in == null) throw new IOException("Cannot open file");
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                }
+                runOnUiThread(() -> appendLog("Analyzing recording..."));
+                runAnalysisAndPublish(tmp.getAbsolutePath());
+            } catch (Exception e) {
+                final String msg = "Load failed: " + e.getMessage();
+                runOnUiThread(() -> appendLog(msg));
+            } finally {
+                if (tmp != null) tmp.delete();
+            }
+        });
+    }
+
+    private void runAnalysisAndPublish(String path) {
+        try {
+            Python py = Python.getInstance();
+            PyObject module = py.getModule("watchpat_android");
+            String jsonText = module.callAttr("analyze_json", path).toString();
+            JSONObject payload = new JSONObject(jsonText);
+            String summaryText = payload.optString("summary_text", "Analysis finished");
+            runOnUiThread(() -> appendLog(summaryText));
+
+            JSONObject summary = payload.optJSONObject("summary");
+            if (summary != null && !summary.has("error")) {
+                publishSummaryToMqtt(summary);
+            }
+        } catch (Exception e) {
+            final String msg = "Analysis failed: " + e.getMessage();
+            runOnUiThread(() -> appendLog(msg));
+        }
+    }
+
+    private void publishSummaryToMqtt(JSONObject summary) {
+        SharedPreferences prefs = getSharedPreferences(MqttConfigActivity.PREFS_NAME, Context.MODE_PRIVATE);
+        String serverUri = prefs.getString(MqttConfigActivity.KEY_SERVER_URI, "");
+        String username = prefs.getString(MqttConfigActivity.KEY_USERNAME, "");
+        String password = prefs.getString(MqttConfigActivity.KEY_PASSWORD, "");
+        String normalized = MqttPublisher.normalizeServerUri(serverUri);
+        if (normalized.isEmpty()) {
+            runOnUiThread(() -> appendLog(getString(R.string.mqtt_publish_disabled)));
+            return;
+        }
+
+        try {
+            MqttPublisher.publishSummary(normalized, username, password, summary.toString());
+            runOnUiThread(() ->
+                    appendLog("MQTT summary published to " + normalized + " topic " + MqttPublisher.DEFAULT_TOPIC));
+        } catch (Exception e) {
+            runOnUiThread(() ->
+                    appendLog("MQTT publish failed: " + e.getMessage()));
         }
     }
 
