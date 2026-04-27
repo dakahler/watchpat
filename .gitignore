@@ -8,3 +8,4 @@ android/local.properties
 .claude
 .venv
 .DS_Store
+ios/signing.env

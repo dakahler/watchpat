@@ -130,6 +130,57 @@ The project can publish final analysis summaries over MQTT as a single JSON payl
 
 If Home Assistant MQTT Discovery is enabled and connected to the same broker, the published discovery config should create entities automatically for summary metrics like `AHI`, `pAHI`, `pRDI`, mean `SpO2`, and mean heart rate.
 
+## iOS App
+
+An iOS app scaffold is included in `ios/WatchPATiOS.xcodeproj`. It mirrors the Android app structure with:
+
+- BLE scan/connect/record controls
+- `.dat` analysis using the repo's Kaitai schema (`watchpat.ksy`) as the parser source of truth
+- MQTT settings and final-summary publishing
+
+### Building the iOS app
+
+Simulator build:
+
+```bash
+xcodebuild -project ios/WatchPATiOS.xcodeproj \
+  -scheme WatchPATiOS \
+  -configuration Debug \
+  -sdk iphonesimulator \
+  -derivedDataPath /tmp/WatchPATiOSDerivedData \
+  ONLY_ACTIVE_ARCH=YES ARCHS=arm64 build
+```
+
+### Creating a distributable IPA
+
+You generally need an Apple Developer Program membership plus valid signing assets to create a real device-installable `.ipa`.
+
+Once you have your Apple team ID, copy `ios/signing.env.example` to your own env file or export the variables directly, then run:
+
+```bash
+source ios/signing.env.example   # or your own edited copy
+ios/build_ios_ipa.sh
+```
+
+The export script:
+
+- archives the app for `generic/platform=iOS`
+- applies your `DEVELOPMENT_TEAM` and optional bundle-id override
+- exports the archive to an `.ipa`
+
+Default output locations:
+
+- archive: `ios/build/WatchPATiOS.xcarchive`
+- export folder: `ios/build/export`
+
+Key environment variables:
+
+- `APPLE_TEAM_ID` (required)
+- `WATCHPAT_IOS_BUNDLE_ID`
+- `WATCHPAT_IOS_EXPORT_METHOD`
+- `WATCHPAT_IOS_CODE_SIGN_IDENTITY`
+- `WATCHPAT_IOS_PROVISIONING_PROFILE_SPECIFIER`
+
 ## Tests
 
 ```bash
