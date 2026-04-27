@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Android entry point: analyse a finished .dat recording and return a text summary."""
 
 import json

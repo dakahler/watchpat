@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Pure-analysis primitives for WatchPAT ONE recordings.
 
