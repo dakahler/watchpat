@@ -63,12 +63,21 @@ SLEEP_STAGE_LEVELS = {
 # Signal-processing helpers (used internally by SensorBuffers)
 # ---------------------------------------------------------------------------
 
+def _box_mean(a: np.ndarray, win: int) -> np.ndarray:
+    """O(n) sliding box-mean, identical output to np.convolve(a, ones(win)/win, 'same')."""
+    pad_l = (win - 1) // 2
+    pad_r = win - 1 - pad_l
+    padded = np.pad(np.asarray(a, dtype=float), (pad_l, pad_r))
+    cs = np.zeros(len(padded) + 1, dtype=float)
+    np.cumsum(padded, out=cs[1:])
+    return (cs[win:] - cs[:-win]) / win
+
+
 def _detect_peaks_rt(samples: np.ndarray, rate: int) -> list:
     if len(samples) < rate * 3:
         return []
     win = max(3, int(rate * 0.75))
-    kernel = np.ones(win) / win
-    baseline = np.convolve(samples, kernel, mode="same")
+    baseline = _box_mean(samples, win)
     detrended = samples - baseline
 
     abs_median = float(np.median(np.abs(detrended)))
@@ -76,23 +85,27 @@ def _detect_peaks_rt(samples: np.ndarray, rate: int) -> list:
     refractory = max(1, int(rate * 0.35))
     prom_win = max(3, int(rate * 0.15))
 
+    # Vectorised pre-filter: only local maxima above the threshold become candidates.
+    # The refractory-period and prominence checks then run on this sparse set.
+    mask = (
+        (detrended[1:-1] > threshold)
+        & (detrended[1:-1] > detrended[:-2])
+        & (detrended[1:-1] >= detrended[2:])
+    )
+    candidates = np.where(mask)[0] + 1  # shift back to detrended indices
+
     peaks: list = []
     last_peak = -refractory
-    for i in range(1, len(detrended) - 1):
+    prom_thresh = threshold * 1.2
+    n = len(detrended)
+    for i in candidates:
         if i - last_peak < refractory:
             continue
-        c = detrended[i]
-        if c <= threshold:
-            continue
-        if c <= detrended[i - 1] or c < detrended[i + 1]:
-            continue
         lo = max(0, i - prom_win)
-        hi = min(len(detrended), i + prom_win + 1)
-        local_min = float(np.min(detrended[lo:hi]))
-        if (c - local_min) < threshold * 1.2:
-            continue
-        peaks.append(i)
-        last_peak = i
+        hi = min(n, i + prom_win + 1)
+        if detrended[i] - float(np.min(detrended[lo:hi])) >= prom_thresh:
+            peaks.append(int(i))
+            last_peak = i
     return peaks
 
 
@@ -112,18 +125,6 @@ def _compute_heart_rate(samples: np.ndarray, rate: int) -> float:
     return float(np.median(bpms))
 
 
-def _sinusoid_amplitude(samples: np.ndarray, hz: float, rate: int) -> float:
-    if len(samples) == 0 or hz <= 0:
-        return 0.0
-    mean_val = float(np.mean(samples))
-    n = np.arange(len(samples))
-    angle = 2.0 * math.pi * hz * n / rate
-    centered = samples - mean_val
-    real_part = float(np.sum(centered * np.cos(angle)))
-    imag_part = float(-np.sum(centered * np.sin(angle)))
-    return (2.0 / len(samples)) * math.sqrt(real_part**2 + imag_part**2)
-
-
 def _compute_spo2_pair(red: np.ndarray, ir: np.ndarray, bpm: float,
                        rate: int) -> tuple:
     n = min(len(red), len(ir), rate * 4)
@@ -137,9 +138,16 @@ def _compute_spo2_pair(red: np.ndarray, ir: np.ndarray, bpm: float,
     if abs(red_dc) < 10.0 or abs(ir_dc) < 10.0:
         return -1.0, -1.0
 
-    pulse_hz = bpm / 60.0
-    red_ac = _sinusoid_amplitude(red_win, pulse_hz, rate)
-    ir_ac = _sinusoid_amplitude(ir_win, pulse_hz, rate)
+    angle = (2.0 * math.pi * (bpm / 60.0) / rate) * np.arange(n)
+    cos_t = np.cos(angle)
+    sin_t = np.sin(angle)
+
+    def _ac(win, dc):
+        c = win - dc
+        return (2.0 / n) * math.sqrt(float(np.dot(c, cos_t))**2 + float(np.dot(c, sin_t))**2)
+
+    red_ac = _ac(red_win, red_dc)
+    ir_ac = _ac(ir_win, ir_dc)
     if red_ac <= 0 or ir_ac <= 0:
         return -1.0, -1.0
 
@@ -151,6 +159,44 @@ def _compute_spo2_pair(red: np.ndarray, ir: np.ndarray, bpm: float,
     if 60.0 <= spo2 <= 100.0:
         return spo2, ratio
     return -1.0, ratio
+
+
+def _compute_spo2_dual(a: np.ndarray, b: np.ndarray, bpm: float,
+                       rate: int) -> tuple[float, float, float, float]:
+    """Compute SpO2 for both (a,b) and (b,a) orderings, sharing one sinusoid pass."""
+    n = min(len(a), len(b), rate * 4)
+    if n < rate * 2:
+        return -1.0, -1.0, -1.0, -1.0
+    a_win = a[-n:]
+    b_win = b[-n:]
+    a_dc = float(np.mean(a_win))
+    b_dc = float(np.mean(b_win))
+    if abs(a_dc) < 10.0 or abs(b_dc) < 10.0:
+        return -1.0, -1.0, -1.0, -1.0
+
+    angle = (2.0 * math.pi * (bpm / 60.0) / rate) * np.arange(n)
+    cos_t = np.cos(angle)
+    sin_t = np.sin(angle)
+
+    def _ac(win, dc):
+        c = win - dc
+        return (2.0 / n) * math.sqrt(float(np.dot(c, cos_t))**2 + float(np.dot(c, sin_t))**2)
+
+    a_ac = _ac(a_win, a_dc)
+    b_ac = _ac(b_win, b_dc)
+
+    def _spo2_ratio(red_ac, red_dc, ir_ac, ir_dc):
+        if red_ac <= 0 or ir_ac <= 0:
+            return -1.0, -1.0
+        if red_ac / abs(red_dc) > 0.5 or ir_ac / abs(ir_dc) > 0.5:
+            return -1.0, -1.0
+        ratio = abs((red_ac / red_dc) / (ir_ac / ir_dc))
+        spo2 = 116.0 - 25.0 * ratio
+        return (spo2, ratio) if 60.0 <= spo2 <= 100.0 else (-1.0, ratio)
+
+    spo2_ab, ratio_ab = _spo2_ratio(a_ac, a_dc, b_ac, b_dc)
+    spo2_ba, ratio_ba = _spo2_ratio(b_ac, b_dc, a_ac, a_dc)
+    return spo2_ab, ratio_ab, spo2_ba, ratio_ba
 
 
 def _compute_motion_level(ax: deque, ay: deque, az: deque) -> float:
@@ -172,8 +218,7 @@ def _compute_resp_features(samples: np.ndarray, rate: int) -> tuple[float, float
         return -1.0, -1.0, -1.0
     window = samples[-n:].astype(float)
     smooth_win = max(3, rate // 2)
-    kernel = np.ones(smooth_win) / smooth_win
-    baseline = np.convolve(window, kernel, mode="same")
+    baseline = _box_mean(window, smooth_win)
     detrended = window - baseline
     amp = float(np.percentile(detrended, 90) - np.percentile(detrended, 10))
     if amp <= 0:
@@ -185,7 +230,7 @@ def _compute_resp_features(samples: np.ndarray, rate: int) -> tuple[float, float
     if bpm < 4.0 or bpm > 40.0:
         bpm = -1.0
     env_win = max(3, rate)
-    envelope = np.convolve(np.abs(detrended), np.ones(env_win) / env_win, mode="same")
+    envelope = _box_mean(np.abs(detrended), env_win)
     env_mean = float(np.mean(envelope))
     variability = float(np.std(envelope) / env_mean) if env_mean > 1e-6 else -1.0
     return bpm, amp, variability
@@ -267,6 +312,10 @@ class SensorBuffers:
         self.rdi_estimate = -1.0
         self.sleep_stage_counts: Counter = Counter()
         self.sleep_stage_total = 0
+        self._sleep_stage_context_at = -1.0
+        self._sleep_stage_context = None
+        self._resp_cache: tuple = (-1.0, -1.0, -1.0)
+        self._resp_cache_time: float = 0.0
 
     def feed(self, pkt, now: float = None):
         """Ingest a parsed data packet into the rolling buffers."""
@@ -309,57 +358,81 @@ class SensorBuffers:
                 self._last_derive_time = now
                 self._update_derived(now=now)
 
-    def _valid_recent(self, values: deque, limit: int) -> np.ndarray:
-        arr = np.asarray(list(values)[-limit:], dtype=float)
-        if arr.size == 0:
+    def _recent_valid_array(self, values: deque, limit: int) -> np.ndarray:
+        if not values:
             return np.array([])
+        sliced = list(values)[-limit:]
+        arr = np.asarray(sliced, dtype=float)
         return arr[~np.isnan(arr)]
+
+    def _sleep_stage_thresholds(self, elapsed: float) -> dict[str, float]:
+        if (
+            self._sleep_stage_context is not None
+            and elapsed - self._sleep_stage_context_at < 15.0
+        ):
+            return self._sleep_stage_context
+
+        long_hr = self._recent_valid_array(self.hr_full_history, 600)
+        long_motion = self._recent_valid_array(self.motion_level_history, 600)
+        long_resp_var = self._recent_valid_array(self.resp_variability_history, 600)
+        long_pat = self._recent_valid_array(self.pat_amp_history, 600)
+        ctx = {
+            "hr_low": float(np.percentile(long_hr, 35)) if long_hr.size else -1.0,
+            "hr_high": float(np.percentile(long_hr, 70)) if long_hr.size else -1.0,
+            "motion_low": (
+                float(np.percentile(long_motion, 35)) if long_motion.size else -1.0
+            ),
+            "motion_high": (
+                float(np.percentile(long_motion, 75)) if long_motion.size else -1.0
+            ),
+            "resp_low": (
+                float(np.percentile(long_resp_var, 35)) if long_resp_var.size else -1.0
+            ),
+            "resp_high": (
+                float(np.percentile(long_resp_var, 70)) if long_resp_var.size else -1.0
+            ),
+            "pat_low": float(np.percentile(long_pat, 30)) if long_pat.size else -1.0,
+            "pat_high": float(np.percentile(long_pat, 70)) if long_pat.size else -1.0,
+        }
+        self._sleep_stage_context = ctx
+        self._sleep_stage_context_at = elapsed
+        return ctx
 
     def _estimate_sleep_stage(
         self,
         motion_level: float,
         resp_variability: float,
         pat_ratio: float,
+        elapsed: float,
     ) -> str:
         if len(self.hr_full_history) < 30:
             return SLEEP_STAGE_AWAKE
 
-        recent_hr = self._valid_recent(self.hr_full_history, 30)
-        recent_motion = self._valid_recent(self.motion_level_history, 30)
-        recent_resp_var = self._valid_recent(self.resp_variability_history, 30)
-        recent_spo2 = self._valid_recent(self.spo2_full_history, 30)
-        recent_pat = self._valid_recent(self.pat_amp_history, 30)
-        long_hr = self._valid_recent(self.hr_full_history, 600)
-        long_motion = self._valid_recent(self.motion_level_history, 600)
-        long_resp_var = self._valid_recent(self.resp_variability_history, 600)
-        long_pat = self._valid_recent(self.pat_amp_history, 600)
+        recent_hr = self._recent_valid_array(self.hr_full_history, 30)
+        recent_motion = self._recent_valid_array(self.motion_level_history, 30)
+        recent_resp_var = self._recent_valid_array(self.resp_variability_history, 30)
+        recent_spo2 = self._recent_valid_array(self.spo2_full_history, 30)
+        recent_pat = self._recent_valid_array(self.pat_amp_history, 30)
 
         if recent_hr.size < 10 or recent_motion.size < 10:
             return SLEEP_STAGE_AWAKE
 
+        ctx = self._sleep_stage_thresholds(elapsed)
         hr_now = float(np.mean(recent_hr[-10:]))
         hr_std = float(np.std(recent_hr[-30:])) if recent_hr.size >= 5 else 0.0
-        hr_low = float(np.percentile(long_hr, 35)) if long_hr.size else hr_now
-        hr_high = float(np.percentile(long_hr, 70)) if long_hr.size else hr_now
+        hr_low = ctx["hr_low"] if ctx["hr_low"] >= 0 else hr_now
+        hr_high = ctx["hr_high"] if ctx["hr_high"] >= 0 else hr_now
         motion_now = float(np.mean(recent_motion[-10:]))
-        motion_low = (
-            float(np.percentile(long_motion, 35)) if long_motion.size else motion_now
-        )
-        motion_high = (
-            float(np.percentile(long_motion, 75)) if long_motion.size else motion_now
-        )
+        motion_low = ctx["motion_low"] if ctx["motion_low"] >= 0 else motion_now
+        motion_high = ctx["motion_high"] if ctx["motion_high"] >= 0 else motion_now
         resp_now = (
             float(np.mean(recent_resp_var[-10:])) if recent_resp_var.size else resp_variability
         )
         pat_now = float(np.mean(recent_pat[-10:])) if recent_pat.size else pat_ratio
-        resp_low = (
-            float(np.percentile(long_resp_var, 35)) if long_resp_var.size else resp_now
-        )
-        resp_high = (
-            float(np.percentile(long_resp_var, 70)) if long_resp_var.size else resp_now
-        )
-        pat_low = float(np.percentile(long_pat, 30)) if long_pat.size else pat_now
-        pat_high = float(np.percentile(long_pat, 70)) if long_pat.size else pat_now
+        resp_low = ctx["resp_low"] if ctx["resp_low"] >= 0 else resp_now
+        resp_high = ctx["resp_high"] if ctx["resp_high"] >= 0 else resp_now
+        pat_low = ctx["pat_low"] if ctx["pat_low"] >= 0 else pat_now
+        pat_high = ctx["pat_high"] if ctx["pat_high"] >= 0 else pat_now
         spo2_drop = 0.0
         if recent_spo2.size:
             spo2_drop = float(max(0.0, np.max(recent_spo2) - np.min(recent_spo2)))
@@ -430,21 +503,15 @@ class SensorBuffers:
             a_arr = np.array(self.oxi_a)
             b_arr = np.array(self.oxi_b)
 
-            n_check = min(len(a_arr), len(b_arr), WAVEFORM_RATE * 4)
-            a_tail = a_arr[-n_check:]
-            b_tail = b_arr[-n_check:]
-            dc_a, dc_b = float(np.mean(a_tail)), float(np.mean(b_tail))
-            if abs(dc_a) > 10 and abs(dc_b) > 10:
-                dc_ratio = dc_a / dc_b
-            else:
-                dc_ratio = 1.0
+            tail = WAVEFORM_RATE * 4
+            dc_a = float(np.mean(a_arr[-tail:]))
+            dc_b = float(np.mean(b_arr[-tail:]))
+            dc_ratio = (dc_a / dc_b) if (abs(dc_a) > 10 and abs(dc_b) > 10) else 1.0
             channels_distinct = abs(dc_ratio - 1.0) > 0.08
 
             if channels_distinct:
-                spo2_ab, ratio_ab = _compute_spo2_pair(
+                spo2_ab, ratio_ab, spo2_ba, ratio_ba = _compute_spo2_dual(
                     a_arr, b_arr, hr, WAVEFORM_RATE)
-                spo2_ba, ratio_ba = _compute_spo2_pair(
-                    b_arr, a_arr, hr, WAVEFORM_RATE)
                 self._spo2_score_ab *= 0.9
                 self._spo2_score_ba *= 0.9
                 if spo2_ab > 0 and ratio_ab > 0 and 0.4 <= ratio_ab <= 1.3:
@@ -475,9 +542,14 @@ class SensorBuffers:
         elapsed = now - self.start_time if self.start_time else 0.0
         motion_level = _compute_motion_level(
             self.accel_x, self.accel_y, self.accel_z)
-        chest_arr = np.array(self.chest) if len(self.chest) >= WAVEFORM_RATE * 4 else np.array([])
-        resp_rate, resp_amp, resp_variability = _compute_resp_features(
-            chest_arr, WAVEFORM_RATE) if len(chest_arr) else (-1.0, -1.0, -1.0)
+        if now - self._resp_cache_time >= 5.0:
+            chest_arr = np.array(self.chest) if len(self.chest) >= WAVEFORM_RATE * 4 else np.array([])
+            self._resp_cache = (
+                _compute_resp_features(chest_arr, WAVEFORM_RATE)
+                if len(chest_arr) else (-1.0, -1.0, -1.0)
+            )
+            self._resp_cache_time = now
+        resp_rate, resp_amp, resp_variability = self._resp_cache
         pat_ratio = -1.0
         if self.current_spo2 > 0:
             if record_history:
@@ -594,6 +666,7 @@ class SensorBuffers:
                 motion_level=motion_level,
                 resp_variability=resp_variability,
                 pat_ratio=pat_ratio,
+                elapsed=elapsed,
             )
             self.current_sleep_stage = stage
             self.sleep_stage_label_history.append(stage)

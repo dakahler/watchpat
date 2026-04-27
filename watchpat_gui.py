@@ -74,6 +74,7 @@ from watchpat_analysis import (
 )
 
 FPS = 15
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 CHANNEL_COLORS = {
     "OxiA":  "#e74c3c",
@@ -295,6 +296,7 @@ class WatchPATDashboard:
         self.replay_button = None
         self.replay_status_text = None
         self._ignore_slider_change = False
+        self._loading_tick = 0
         self._build_figure()
 
     def _build_figure(self):
@@ -587,6 +589,22 @@ class WatchPATDashboard:
             ha="right", va="bottom", fontsize=9, fontweight="bold",
             color="#7f8c8d", transform=self.ax_apnea.transAxes)
 
+        self._loading_text = self.fig.text(
+            0.5, 0.5, "",
+            ha="center", va="center",
+            fontsize=18, fontweight="bold",
+            color="#ecf0f1",
+            visible=False,
+            zorder=10,
+            bbox=dict(
+                boxstyle="round,pad=0.7",
+                facecolor="#0f0f23",
+                edgecolor="#4a4a8a",
+                alpha=0.92,
+                linewidth=1.5,
+            ),
+        )
+
         self.fig.canvas.mpl_connect("close_event", self._on_close)
         manager = getattr(self.fig.canvas, "manager", None)
         window = getattr(manager, "window", None)
@@ -718,9 +736,16 @@ class WatchPATDashboard:
                 self.enable_replay_scrubber(payload)
                 self.set_mode_label(self._pending_replay_label)
                 self._pending_replay_queue = None
+                self._loading_text.set_visible(False)
             elif status == "error":
                 self.set_mode_label(f"Replay load failed: {payload}")
                 self._pending_replay_queue = None
+                self._loading_text.set_visible(False)
+            else:
+                self._loading_tick += 1
+                s = _SPINNER[(self._loading_tick // 3) % len(_SPINNER)]
+                self._loading_text.set_text(f"  {s}  Analysing recording…  ")
+                self._loading_text.set_visible(True)
 
         if self.replay_controller is not None:
             packets_per_second = (self.replay_controller.speed
@@ -1181,18 +1206,24 @@ Examples:
     buffers = SensorBuffers()
     stop_event = threading.Event()
     dashboard = WatchPATDashboard(buffers)
-    replay_controller = None
 
     if args.replay:
-        dashboard.set_mode_label(f"Replay: {args.replay}  ({args.speed}x)")
-        replay_controller = ReplayController(
-            args.replay,
-            args.speed,
-            use_cache=not args.nocache,
+        dashboard.set_mode_label(f"Replay: {args.replay}  (loading…)")
+        replay_queue = Queue()
+        dashboard.attach_replay_loader(
+            replay_queue,
+            f"Replay: {args.replay}  ({args.speed}x)",
         )
-        dashboard.enable_replay_scrubber(replay_controller)
-        dashboard.buffers = replay_controller.buffers
-        t = None
+        _path, _speed, _cache = args.replay, args.speed, not args.nocache
+
+        def _load_replay():
+            try:
+                ctrl = ReplayController(_path, _speed, use_cache=_cache)
+                replay_queue.put(("ready", ctrl))
+            except Exception as exc:
+                replay_queue.put(("error", str(exc)))
+
+        t = threading.Thread(target=_load_replay, daemon=True)
     else:
         out = args.output
         if not out:
