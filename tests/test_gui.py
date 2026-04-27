@@ -7,6 +7,7 @@ import time
 import tempfile
 import unittest
 from unittest import mock
+from queue import Queue
 
 import numpy as np
 
@@ -193,6 +194,26 @@ class TestWatchPATDashboard(unittest.TestCase):
             self.dashboard.ax_apnea.get_position().y0,
         )
 
+    def test_update_attaches_loaded_replay_controller(self):
+        controller = mock.Mock()
+        controller.buffers = self.buffers
+        controller.full_buffers = self.buffers
+        controller.current_index = 0
+        controller.packet_count = 12
+        controller.paused = True
+        controller.speed = 1.0
+        controller.advance = mock.Mock(return_value=self.buffers)
+
+        replay_queue = Queue()
+        replay_queue.put(("ready", controller))
+        self.dashboard.attach_replay_loader(replay_queue, "Replay: ready")
+
+        self.dashboard.update(frame=0)
+
+        self.assertIs(self.dashboard.replay_controller, controller)
+        self.assertEqual(self.dashboard.mode_text.get_text(), "Replay: ready")
+        self.assertIsNotNone(self.dashboard.replay_slider)
+
     def test_event_markers_reset_when_scrubbing_backwards(self):
         with self.buffers.lock:
             self.buffers.start_time = time.time() - 3600
@@ -265,6 +286,19 @@ class TestBleFeeder(unittest.TestCase):
 
 
 class TestReplayController(unittest.TestCase):
+    def test_nocache_skips_cache_path(self):
+        packet_a = mock.Mock(raw_payload=b"a", waveforms=[], motion=None,
+                             metric=None, events=[])
+
+        with mock.patch.object(watchpat_gui, "read_dat_file", return_value=[b"a"]):
+            with mock.patch.object(watchpat_gui, "parse_data_packet",
+                                   return_value=packet_a):
+                ctrl = watchpat_gui.ReplayController(
+                    "capture.dat", speed=1.0, use_cache=False)
+
+        self.assertFalse(ctrl.use_cache)
+        self.assertEqual(ctrl.packet_count, 1)
+
     def test_seek_rebuilds_buffers_to_requested_packet(self):
         packet_a = mock.Mock(raw_payload=b"a", waveforms=[], motion=None,
                              metric=None, events=[])

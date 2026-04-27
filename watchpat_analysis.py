@@ -11,7 +11,7 @@ the desktop where watchpat_gui.py adds the live rendering layer.
 import math
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 
 import numpy as np
 
@@ -246,6 +246,7 @@ class SensorBuffers:
         self.spo2_full_history: deque = deque(maxlen=4 * 3600)
         self.spo2_full_times: deque = deque(maxlen=4 * 3600)
         self.apnea_events: list = []
+        self.apnea_event_count = 0
         self.ahi_estimate = -1.0
         self._desat_baseline: deque = deque(maxlen=120)
         self._desat_in_event = False
@@ -255,13 +256,17 @@ class SensorBuffers:
         self.pat_amp_history: deque = deque(maxlen=4 * 3600)
         self.pat_amp_times: deque = deque(maxlen=4 * 3600)
         self.pat_events: list = []
+        self.pat_event_type_counts: Counter = Counter()
         self.pahi_estimate = -1.0
         self._pat_baseline_buf: deque = deque(maxlen=300)
         self._pat_in_event = False
         self._pat_event_start = 0.0
         self._pat_hr_baseline = -1.0
         self.central_events: list = []
+        self.central_event_count = 0
         self.rdi_estimate = -1.0
+        self.sleep_stage_counts: Counter = Counter()
+        self.sleep_stage_total = 0
 
     def feed(self, pkt, now: float = None):
         """Ingest a parsed data packet into the rolling buffers."""
@@ -389,17 +394,21 @@ class SensorBuffers:
         return SLEEP_STAGE_LIGHT
 
     def sleep_stage_percentages(self) -> dict[str, float]:
-        total = len(self.sleep_stage_label_history)
+        total = self.sleep_stage_total
+        counts = self.sleep_stage_counts
+        if total <= 0 and self.sleep_stage_label_history:
+            total = len(self.sleep_stage_label_history)
+            counts = Counter(self.sleep_stage_label_history)
         if total <= 0:
             return {stage: 0.0 for stage in SLEEP_STAGE_ORDER}
-        counts = {
-            stage: sum(1 for value in self.sleep_stage_label_history if value == stage)
-            for stage in SLEEP_STAGE_ORDER
-        }
-        return {
-            stage: round((100.0 * counts[stage]) / total, 1)
-            for stage in SLEEP_STAGE_ORDER
-        }
+        percentages = {}
+        running = 0.0
+        for stage in SLEEP_STAGE_ORDER[:-1]:
+            pct = round((100.0 * counts.get(stage, 0)) / total, 1)
+            percentages[stage] = pct
+            running += pct
+        percentages[SLEEP_STAGE_ORDER[-1]] = round(max(0.0, 100.0 - running), 1)
+        return percentages
 
     def _update_derived(self, now: float = None, record_history: bool = True):
         """Compute HR and SpO2 from current buffers (called with lock held)."""
@@ -490,6 +499,7 @@ class SensorBuffers:
                         if elapsed - self._desat_start_elapsed >= 10.0:
                             self.apnea_events.append(
                                 (self._desat_start_elapsed, self._desat_nadir))
+                            self.apnea_event_count += 1
                             pat_times = [ev[0] for ev in self.pat_events]
                             has_concurrent_pat = (
                                 self._pat_in_event or
@@ -499,6 +509,7 @@ class SensorBuffers:
                                 self.central_events.append(
                                     (self._desat_start_elapsed,
                                      baseline - self._desat_nadir))
+                                self.central_event_count += 1
                         self._desat_in_event = False
 
         if len(self.pat) >= WAVEFORM_RATE * 3:
@@ -551,14 +562,21 @@ class SensorBuffers:
                                 self.pat_events.append(
                                     (self._pat_event_start, ratio,
                                      hr_rise, spo2_drop, evt_type))
+                                self.pat_event_type_counts[evt_type] += 1
                             self._pat_in_event = False
 
         if elapsed >= 60.0 and self.start_time:
             hours = elapsed / 3600.0
-            n_apnea = sum(1 for ev in self.pat_events if ev[4] == EVT_APNEA)
-            n_hyp   = sum(1 for ev in self.pat_events if ev[4] == EVT_HYPOPNEA)
-            n_rera  = sum(1 for ev in self.pat_events if ev[4] == EVT_RERA)
-            self.ahi_estimate  = len(self.apnea_events) / hours
+            if self.pat_event_type_counts:
+                n_apnea = self.pat_event_type_counts.get(EVT_APNEA, 0)
+                n_hyp   = self.pat_event_type_counts.get(EVT_HYPOPNEA, 0)
+                n_rera  = self.pat_event_type_counts.get(EVT_RERA, 0)
+            else:
+                n_apnea = sum(1 for ev in self.pat_events if ev[4] == EVT_APNEA)
+                n_hyp   = sum(1 for ev in self.pat_events if ev[4] == EVT_HYPOPNEA)
+                n_rera  = sum(1 for ev in self.pat_events if ev[4] == EVT_RERA)
+            apnea_count = self.apnea_event_count if self.apnea_event_count > 0 else len(self.apnea_events)
+            self.ahi_estimate  = apnea_count / hours
             self.pahi_estimate = (n_apnea + n_hyp) / hours
             self.rdi_estimate  = (n_apnea + n_hyp + n_rera) / hours
 
@@ -581,14 +599,18 @@ class SensorBuffers:
             self.sleep_stage_label_history.append(stage)
             self.sleep_stage_history.append(SLEEP_STAGE_LEVELS[stage])
             self.sleep_stage_times.append(elapsed)
+            self.sleep_stage_counts[stage] += 1
+            self.sleep_stage_total += 1
 
     def _waveform_buf(self, name: str):
         return {"OxiA": self.oxi_a, "OxiB": self.oxi_b,
                 "PAT": self.pat, "Chest": self.chest}.get(name)
 
-    def clone(self):
+    def clone(self, compact: bool = False):
         other = SensorBuffers()
         with self.lock:
+            recent_seconds = 600
+            recent_stage = 120
             for name in (
                 "oxi_a", "oxi_b", "pat", "chest",
                 "accel_x", "accel_y", "accel_z", "field_a", "field_b",
@@ -604,8 +626,24 @@ class SensorBuffers:
                 "sleep_stage_history", "sleep_stage_times",
                 "sleep_stage_label_history",
             ):
-                setattr(other, name, deque(getattr(self, name),
-                                           maxlen=getattr(self, name).maxlen))
+                values = getattr(self, name)
+                copied = values
+                if compact:
+                    if name in {
+                        "spo2_full_history", "spo2_full_times",
+                        "pat_amp_history", "pat_amp_times",
+                        "hr_full_history", "hr_full_times",
+                        "motion_level_history", "motion_level_times",
+                        "resp_rate_history", "resp_amp_history",
+                        "resp_variability_history",
+                    }:
+                        copied = list(values)[-recent_seconds:]
+                    elif name in {
+                        "sleep_stage_history", "sleep_stage_times",
+                        "sleep_stage_label_history",
+                    }:
+                        copied = list(values)[-recent_stage:]
+                setattr(other, name, deque(copied, maxlen=values.maxlen))
             other.current_hr = self.current_hr
             other.current_spo2 = self.current_spo2
             other._last_derive_time = self._last_derive_time
@@ -621,18 +659,117 @@ class SensorBuffers:
             other.start_time = self.start_time
             other.last_motion_crc_ok = self.last_motion_crc_ok
             other.last_motion_crc_total = self.last_motion_crc_total
-            other.apnea_events = list(self.apnea_events)
+            other.apnea_events = list(self.apnea_events if not compact else [])
+            other.apnea_event_count = self.apnea_event_count
             other.ahi_estimate = self.ahi_estimate
             other._desat_in_event = self._desat_in_event
             other._desat_start_elapsed = self._desat_start_elapsed
             other._desat_nadir = self._desat_nadir
-            other.pat_events = list(self.pat_events)
+            other.pat_events = list(self.pat_events if not compact else [])
+            other.pat_event_type_counts = Counter(self.pat_event_type_counts)
             other.pahi_estimate = self.pahi_estimate
             other._pat_in_event = self._pat_in_event
             other._pat_event_start = self._pat_event_start
             other._pat_hr_baseline = self._pat_hr_baseline
-            other.central_events = list(self.central_events)
+            other.central_events = list(self.central_events if not compact else [])
+            other.central_event_count = self.central_event_count
             other.rdi_estimate = self.rdi_estimate
+            other.sleep_stage_counts = Counter(self.sleep_stage_counts)
+            other.sleep_stage_total = self.sleep_stage_total
+        return other
+
+    def serialize_state(self) -> dict:
+        with self.lock:
+            state = {}
+            for name in (
+                "oxi_a", "oxi_b", "pat", "chest",
+                "accel_x", "accel_y", "accel_z", "field_a", "field_b",
+                "hr_history", "spo2_history", "events",
+                "spo2_full_history", "spo2_full_times",
+                "_desat_baseline",
+                "pat_amp_history", "pat_amp_times", "_pat_baseline_buf",
+                "_spo2_raw",
+                "hr_full_history", "hr_full_times",
+                "motion_level_history", "motion_level_times",
+                "resp_rate_history", "resp_amp_history",
+                "resp_variability_history",
+                "sleep_stage_history", "sleep_stage_times",
+                "sleep_stage_label_history",
+            ):
+                values = getattr(self, name)
+                state[name] = {"items": list(values), "maxlen": values.maxlen}
+            state.update({
+                "current_hr": self.current_hr,
+                "current_spo2": self.current_spo2,
+                "_last_derive_time": self._last_derive_time,
+                "_spo2_score_ab": self._spo2_score_ab,
+                "_spo2_score_ba": self._spo2_score_ba,
+                "_spo2_ema": self._spo2_ema,
+                "current_sleep_stage": self.current_sleep_stage,
+                "body_position": self.body_position,
+                "body_position_label": self.body_position_label,
+                "metric_value": self.metric_value,
+                "packet_count": self.packet_count,
+                "total_bytes": self.total_bytes,
+                "start_time": self.start_time,
+                "last_motion_crc_ok": self.last_motion_crc_ok,
+                "last_motion_crc_total": self.last_motion_crc_total,
+                "apnea_events": list(self.apnea_events),
+                "apnea_event_count": self.apnea_event_count,
+                "ahi_estimate": self.ahi_estimate,
+                "_desat_in_event": self._desat_in_event,
+                "_desat_start_elapsed": self._desat_start_elapsed,
+                "_desat_nadir": self._desat_nadir,
+                "pat_events": list(self.pat_events),
+                "pat_event_type_counts": dict(self.pat_event_type_counts),
+                "pahi_estimate": self.pahi_estimate,
+                "_pat_in_event": self._pat_in_event,
+                "_pat_event_start": self._pat_event_start,
+                "_pat_hr_baseline": self._pat_hr_baseline,
+                "central_events": list(self.central_events),
+                "central_event_count": self.central_event_count,
+                "rdi_estimate": self.rdi_estimate,
+                "sleep_stage_counts": dict(self.sleep_stage_counts),
+                "sleep_stage_total": self.sleep_stage_total,
+            })
+            return state
+
+    @classmethod
+    def from_serialized_state(cls, state: dict) -> "SensorBuffers":
+        other = cls()
+        with other.lock:
+            for name in (
+                "oxi_a", "oxi_b", "pat", "chest",
+                "accel_x", "accel_y", "accel_z", "field_a", "field_b",
+                "hr_history", "spo2_history", "events",
+                "spo2_full_history", "spo2_full_times",
+                "_desat_baseline",
+                "pat_amp_history", "pat_amp_times", "_pat_baseline_buf",
+                "_spo2_raw",
+                "hr_full_history", "hr_full_times",
+                "motion_level_history", "motion_level_times",
+                "resp_rate_history", "resp_amp_history",
+                "resp_variability_history",
+                "sleep_stage_history", "sleep_stage_times",
+                "sleep_stage_label_history",
+            ):
+                payload = state[name]
+                setattr(other, name, deque(payload["items"], maxlen=payload["maxlen"]))
+            for name in (
+                "current_hr", "current_spo2", "_last_derive_time",
+                "_spo2_score_ab", "_spo2_score_ba", "_spo2_ema",
+                "current_sleep_stage", "body_position", "body_position_label",
+                "metric_value", "packet_count", "total_bytes", "start_time",
+                "last_motion_crc_ok", "last_motion_crc_total",
+                "apnea_events", "apnea_event_count", "ahi_estimate",
+                "_desat_in_event", "_desat_start_elapsed", "_desat_nadir",
+                "pat_events", "pahi_estimate", "_pat_in_event",
+                "_pat_event_start", "_pat_hr_baseline", "central_events",
+                "central_event_count", "rdi_estimate", "sleep_stage_total",
+            ):
+                setattr(other, name, state[name])
+            other.pat_event_type_counts = Counter(state["pat_event_type_counts"])
+            other.sleep_stage_counts = Counter(state["sleep_stage_counts"])
         return other
 
     def snapshot(self):
@@ -665,15 +802,18 @@ class SensorBuffers:
                 "spo2_full_times": (np.array(self.spo2_full_times)
                                     if self.spo2_full_times else np.array([])),
                 "apnea_events": list(self.apnea_events),
+                "apnea_event_count": self.apnea_event_count,
                 "ahi_estimate": self.ahi_estimate,
                 "pat_amp_history": (np.array(self.pat_amp_history)
                                     if self.pat_amp_history else np.array([])),
                 "pat_amp_times": (np.array(self.pat_amp_times)
                                   if self.pat_amp_times else np.array([])),
                 "pat_events": list(self.pat_events),
+                "pat_event_counts": dict(self.pat_event_type_counts),
                 "pahi_estimate": self.pahi_estimate,
                 "rdi_estimate": self.rdi_estimate,
                 "central_events": list(self.central_events),
+                "central_event_count": self.central_event_count,
                 "hr_full_history": (np.array(self.hr_full_history)
                                     if self.hr_full_history else np.array([])),
                 "hr_full_times": (np.array(self.hr_full_times)

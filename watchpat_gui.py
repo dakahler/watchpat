@@ -13,14 +13,17 @@ Usage:
 
 import argparse
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 import logging
 import math
 import os
+import pickle
 import struct
 import sys
 import threading
 import time
 from collections import deque
+from hashlib import sha1
 from queue import Queue, Empty
 from typing import Optional
 
@@ -121,32 +124,119 @@ def _normalize_replay_payload(raw: bytes) -> bytes:
     return raw
 
 
+def _decode_packet_chunk(chunk):
+    start_idx, raw_packets = chunk
+    return [
+        parse_data_packet(_normalize_replay_payload(raw), start_idx + offset)
+        for offset, raw in enumerate(raw_packets)
+    ]
+
+
+def _decode_packets_for_replay(path: str) -> list[ParsedDataPacket]:
+    raw_packets = list(read_dat_file(path))
+    if len(raw_packets) <= 512 or os.cpu_count() == 1:
+        return [
+            parse_data_packet(_normalize_replay_payload(raw), idx)
+            for idx, raw in enumerate(raw_packets)
+        ]
+
+    workers = min(8, max(2, os.cpu_count() or 2))
+    chunk_size = max(256, int(math.ceil(len(raw_packets) / float(workers * 4))))
+    chunks = [
+        (start_idx, raw_packets[start_idx:start_idx + chunk_size])
+        for start_idx in range(0, len(raw_packets), chunk_size)
+    ]
+    packets: list[ParsedDataPacket] = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for decoded in executor.map(_decode_packet_chunk, chunks):
+            packets.extend(decoded)
+    return packets
+
+
 class ReplayController:
     """Owns replay state so the GUI can seek and scrub arbitrarily."""
 
     CHECKPOINT_INTERVAL = 300
 
-    def __init__(self, path: str, speed: float = 1.0):
+    def __init__(self, path: str, speed: float = 1.0, use_cache: bool = True):
         self.path = path
         self.speed = speed
+        self.use_cache = use_cache
         self._playhead = 0.0
         self._paused = speed <= 0
         self.packets: list[ParsedDataPacket] = []
         self.checkpoints: dict[int, SensorBuffers] = {0: SensorBuffers()}
-        checkpoint_builder = SensorBuffers()
-        for idx, raw in enumerate(read_dat_file(path)):
-            payload = _normalize_replay_payload(raw)
-            pkt = parse_data_packet(payload, idx)
-            self.packets.append(pkt)
-            checkpoint_builder.feed(pkt, now=float(idx + 1))
-            next_index = idx + 1
-            if next_index % self.CHECKPOINT_INTERVAL == 0:
-                self.checkpoints[next_index] = checkpoint_builder.clone()
-        self.full_buffers = checkpoint_builder.clone()
+        self.full_buffers = SensorBuffers()
+        if not self._load_cache():
+            checkpoint_builder = SensorBuffers()
+            packet_source = (
+                _decode_packets_for_replay(path)
+                if os.path.exists(path)
+                else [
+                    parse_data_packet(_normalize_replay_payload(raw), idx)
+                    for idx, raw in enumerate(read_dat_file(path))
+                ]
+            )
+            for idx, pkt in enumerate(packet_source):
+                self.packets.append(pkt)
+                checkpoint_builder.feed(pkt, now=float(idx + 1))
+                next_index = idx + 1
+                if next_index % self.CHECKPOINT_INTERVAL == 0:
+                    self.checkpoints[next_index] = checkpoint_builder.clone(compact=True)
+            self.full_buffers = checkpoint_builder.clone()
+            self._save_cache()
         self.buffers = SensorBuffers()
         self.current_index = 0
         if speed <= 0 and self.packets:
             self.seek(len(self.packets))
+
+    def _cache_path(self) -> str:
+        abs_path = os.path.abspath(self.path)
+        if os.path.exists(self.path):
+            stat = os.stat(self.path)
+            key = f"{abs_path}::{stat.st_size}::{int(stat.st_mtime)}"
+        else:
+            key = abs_path
+        digest = sha1(key.encode("utf-8")).hexdigest()[:16]
+        return os.path.join("/tmp", f"watchpat_replay_{digest}.pkl")
+
+    def _load_cache(self) -> bool:
+        if not self.use_cache:
+            return False
+        cache_path = self._cache_path()
+        if not os.path.exists(cache_path):
+            return False
+        try:
+            with open(cache_path, "rb") as fh:
+                payload = pickle.load(fh)
+            self.packets = payload["packets"]
+            self.checkpoints = {
+                idx: SensorBuffers.from_serialized_state(state)
+                for idx, state in payload["checkpoints"].items()
+            }
+            self.full_buffers = SensorBuffers.from_serialized_state(payload["full_buffers"])
+            return True
+        except Exception:
+            logger.exception("Failed to load replay cache: %s", cache_path)
+            return False
+
+    def _save_cache(self):
+        if not self.use_cache:
+            return
+        cache_path = self._cache_path()
+        try:
+            payload = {
+                "packets": self.packets,
+                "checkpoints": {
+                    idx: buf.serialize_state()
+                    for idx, buf in self.checkpoints.items()
+                },
+                "full_buffers": self.full_buffers.serialize_state(),
+            }
+            with open(cache_path, "wb") as fh:
+                pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            logger.exception("Failed to save replay cache: %s", cache_path)
 
     @property
     def packet_count(self) -> int:
@@ -199,6 +289,8 @@ class WatchPATDashboard:
         self.anim = None
         self._closing = False
         self.replay_controller: Optional[ReplayController] = None
+        self._pending_replay_queue: Optional[Queue] = None
+        self._pending_replay_label = ""
         self.replay_slider = None
         self.replay_button = None
         self.replay_status_text = None
@@ -502,6 +594,11 @@ class WatchPATDashboard:
         if callable(protocol):
             protocol("WM_DELETE_WINDOW", self.request_close)
 
+    def attach_replay_loader(self, replay_queue: Queue, ready_label: str):
+        """Allow replay preprocessing to finish in the background."""
+        self._pending_replay_queue = replay_queue
+        self._pending_replay_label = ready_label
+
     def enable_replay_scrubber(self, controller: ReplayController):
         """Attach replay controls for seeking through preloaded data."""
         self.replay_controller = controller
@@ -611,6 +708,20 @@ class WatchPATDashboard:
 
     def update(self, frame):
         """Animation update callback."""
+        if self.replay_controller is None and self._pending_replay_queue is not None:
+            try:
+                status, payload = self._pending_replay_queue.get_nowait()
+            except Empty:
+                status = None
+                payload = None
+            if status == "ready":
+                self.enable_replay_scrubber(payload)
+                self.set_mode_label(self._pending_replay_label)
+                self._pending_replay_queue = None
+            elif status == "error":
+                self.set_mode_label(f"Replay load failed: {payload}")
+                self._pending_replay_queue = None
+
         if self.replay_controller is not None:
             packets_per_second = (self.replay_controller.speed
                                   if self.replay_controller.speed > 0 else 0.0)
@@ -826,8 +937,10 @@ class WatchPATDashboard:
         pahi = snap["pahi_estimate"]
         rdi  = snap["rdi_estimate"]
         ahi  = snap["ahi_estimate"]
-        current_central_events = snap["central_events"]
-        n_central = len(current_central_events)
+        current_central_count = snap.get("central_event_count", 0)
+        if current_central_count <= 0:
+            current_central_count = len(snap["central_events"])
+        n_central = current_central_count
         primary = pahi if pahi >= 0 else ahi
         if primary >= 0:
             n_a = self._drawn_evt_count[EVT_APNEA]
@@ -865,7 +978,7 @@ class WatchPATDashboard:
         rdi_val  = snap["rdi_estimate"]
         pahi_str = f"{pahi_val:.1f}" if pahi_val >= 0.0 else "--"
         rdi_str  = f"{rdi_val:.1f}"  if rdi_val  >= 0.0 else "--"
-        n_central_stat = len(current_central_events)
+        n_central_stat = current_central_count
         stage_pct = snap["sleep_stage_percentages"]
         current_stage = snap["current_sleep_stage"]
         stats_lines = [
@@ -1051,6 +1164,8 @@ Examples:
                         help="Save raw data to file during live capture")
     parser.add_argument("--scan-time", type=float, default=10.0,
                         help="BLE scan duration in seconds")
+    parser.add_argument("--nocache", action="store_true",
+                        help="Disable replay cache load/save for .dat replay")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging")
     args = parser.parse_args()
@@ -1070,7 +1185,11 @@ Examples:
 
     if args.replay:
         dashboard.set_mode_label(f"Replay: {args.replay}  ({args.speed}x)")
-        replay_controller = ReplayController(args.replay, args.speed)
+        replay_controller = ReplayController(
+            args.replay,
+            args.speed,
+            use_cache=not args.nocache,
+        )
         dashboard.enable_replay_scrubber(replay_controller)
         dashboard.buffers = replay_controller.buffers
         t = None
