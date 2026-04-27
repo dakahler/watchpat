@@ -19,6 +19,7 @@
     <uses-permission
         android:name="android.permission.ACCESS_FINE_LOCATION"
         android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-feature
         android:name="android.hardware.bluetooth_le"
@@ -39,6 +40,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".MqttConfigActivity"
+            android:exported="false"
+            android:label="@string/mqtt_config_title"
+            android:screenOrientation="portrait" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

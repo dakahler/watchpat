@@ -72,4 +72,5 @@ dependencies {
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.cardview:cardview:1.0.0'
     implementation 'io.kaitai:kaitai-struct-runtime:0.10'
+    implementation 'org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5'
 }

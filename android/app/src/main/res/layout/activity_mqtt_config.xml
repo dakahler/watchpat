@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="#F5F5F5">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/mqtt_config_title"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:textColor="#1565C0"
+        android:paddingBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/mqtt_server_label"
+        android:textStyle="bold"
+        android:textSize="14sp"
+        android:paddingBottom="6dp" />
+
+    <EditText
+        android:id="@+id/et_mqtt_server"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="@string/mqtt_server_hint"
+        android:inputType="textUri"
+        android:singleLine="true" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/mqtt_username_label"
+        android:textStyle="bold"
+        android:textSize="14sp"
+        android:paddingTop="14dp"
+        android:paddingBottom="6dp" />
+
+    <EditText
+        android:id="@+id/et_mqtt_username"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:inputType="textEmailAddress"
+        android:singleLine="true" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/mqtt_password_label"
+        android:textStyle="bold"
+        android:textSize="14sp"
+        android:paddingTop="14dp"
+        android:paddingBottom="6dp" />
+
+    <EditText
+        android:id="@+id/et_mqtt_password"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:inputType="textPassword"
+        android:singleLine="true" />
+
+    <Button
+        android:id="@+id/btn_save_mqtt"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/mqtt_save" />
+
+</LinearLayout>

@@ -7,4 +7,13 @@
     <string name="btn_stop_recording">Stop Recording</string>
     <string name="btn_share">Share File</string>
     <string name="btn_analyze">Analyze File…</string>
+    <string name="btn_mqtt_config">MQTT Config</string>
+    <string name="mqtt_config_title">MQTT Settings</string>
+    <string name="mqtt_server_label">MQTT server</string>
+    <string name="mqtt_server_hint">tcp://broker.example.com:1883</string>
+    <string name="mqtt_username_label">Username</string>
+    <string name="mqtt_password_label">Password</string>
+    <string name="mqtt_save">Save</string>
+    <string name="mqtt_saved">MQTT settings saved</string>
+    <string name="mqtt_publish_disabled">MQTT publish skipped: no server configured</string>
 </resources>
