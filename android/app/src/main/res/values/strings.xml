@@ -6,4 +6,5 @@
     <string name="btn_start_recording">Start Recording</string>
     <string name="btn_stop_recording">Stop Recording</string>
     <string name="btn_share">Share File</string>
+    <string name="btn_analyze">Analyze File…</string>
 </resources>

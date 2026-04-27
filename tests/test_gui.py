@@ -19,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import watchpat_gui
+import watchpat_analysis
 
 
 class TestWatchPATDashboard(unittest.TestCase):
@@ -338,7 +339,7 @@ class TestApneaClassification(unittest.TestCase):
         hr_rise ≈12, reliably above the 6 BPM threshold.
         """
         buf = self._recovering_buffers([96.0] * 20, hr_baseline=60.0)
-        with mock.patch.object(watchpat_gui, "_compute_heart_rate", return_value=72.0):
+        with mock.patch.object(watchpat_analysis, "_compute_heart_rate", return_value=72.0):
             with buf.lock:
                 buf._update_derived()
         self.assertEqual(len(buf.pat_events), 1)

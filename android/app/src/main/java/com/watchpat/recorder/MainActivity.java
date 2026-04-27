@@ -16,6 +16,15 @@ import android.widget.TextView;
 import androidx.core.content.FileProvider;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import com.chaquo.python.PyObject;
+import com.chaquo.python.Python;
+import com.chaquo.python.android.AndroidPlatform;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -40,9 +49,12 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
     private Button btnScan;
     private Button btnRecord;
     private Button btnShare;
+    private Button btnAnalyze;
 
     private WatchPatBleManager bleManager;
     private boolean sessionReady = false; // true after SESSION_CONFIRM received
+
+    private final ExecutorService analysisExecutor = Executors.newSingleThreadExecutor();
 
     private final ActivityResultLauncher<String[]> permissionLauncher =
             registerForActivityResult(
@@ -58,6 +70,13 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
                             appendLog("ERROR: Required permissions denied");
                             tvStatus.setText("Permissions denied — cannot scan");
                         }
+                    });
+
+    private final ActivityResultLauncher<String[]> openFileLauncher =
+            registerForActivityResult(
+                    new ActivityResultContracts.OpenDocument(),
+                    uri -> {
+                        if (uri != null) analyzeFromUri(uri);
                     });
 
     private final ActivityResultLauncher<Intent> enableBluetoothLauncher =
@@ -83,15 +102,21 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
         tvPackets = findViewById(R.id.tv_packets);
         tvLog     = findViewById(R.id.tv_log);
         scrollLog = findViewById(R.id.scroll_log);
-        btnScan   = findViewById(R.id.btn_scan);
-        btnRecord = findViewById(R.id.btn_record);
-        btnShare  = findViewById(R.id.btn_share);
+        btnScan    = findViewById(R.id.btn_scan);
+        btnRecord  = findViewById(R.id.btn_record);
+        btnShare   = findViewById(R.id.btn_share);
+        btnAnalyze = findViewById(R.id.btn_analyze);
+
+        if (!Python.isStarted()) {
+            Python.start(new AndroidPlatform(this));
+        }
 
         bleManager = new WatchPatBleManager(this, this);
 
         btnScan.setOnClickListener(v -> onScanButtonClicked());
         btnRecord.setOnClickListener(v -> onRecordButtonClicked());
         btnShare.setOnClickListener(v -> onShareButtonClicked());
+        btnAnalyze.setOnClickListener(v -> openFileLauncher.launch(new String[]{"*/*"}));
     }
 
     @Override
@@ -291,7 +316,45 @@ public class MainActivity extends AppCompatActivity implements WatchPatBleManage
         if (path != null) {
             appendLog("File: " + path);
             btnShare.setVisibility(View.VISIBLE);
+            analyzeRecording(path);
         }
+    }
+
+    private void analyzeRecording(String path) {
+        appendLog("Analyzing recording...");
+        analysisExecutor.execute(() -> {
+            Python py = Python.getInstance();
+            PyObject module = py.getModule("watchpat_android");
+            String summary = module.callAttr("analyze", path).toString();
+            runOnUiThread(() -> appendLog(summary));
+        });
+    }
+
+    private void analyzeFromUri(android.net.Uri uri) {
+        appendLog("Loading file for analysis...");
+        analysisExecutor.execute(() -> {
+            File tmp = null;
+            try {
+                tmp = File.createTempFile("watchpat_", ".dat", getCacheDir());
+                try (InputStream in = getContentResolver().openInputStream(uri);
+                     FileOutputStream out = new FileOutputStream(tmp)) {
+                    if (in == null) throw new IOException("Cannot open file");
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                }
+                runOnUiThread(() -> appendLog("Analyzing recording..."));
+                Python py = Python.getInstance();
+                PyObject module = py.getModule("watchpat_android");
+                String summary = module.callAttr("analyze", tmp.getAbsolutePath()).toString();
+                runOnUiThread(() -> appendLog(summary));
+            } catch (Exception e) {
+                final String msg = "Load failed: " + e.getMessage();
+                runOnUiThread(() -> appendLog(msg));
+            } finally {
+                if (tmp != null) tmp.delete();
+            }
+        });
     }
 
     @Override

@@ -10,18 +10,12 @@ import argparse
 import json
 import math
 import os
-import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from statistics import mean
 from typing import Optional
-from unittest import mock
 
-# Keep the import headless for CLI use on machines without a GUI session.
-os.environ.setdefault("MPLBACKEND", "Agg")
-os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "watchpat-mpl"))
-
-import watchpat_gui
+import watchpat_analysis
 from watchpat_ble import parse_data_packet, read_dat_file
 
 
@@ -82,35 +76,32 @@ def _dominant_position(positions: dict[str, int]) -> str:
 
 
 def summarize_dat_file(path: str) -> RecordingSummary:
-    buffers = watchpat_gui.SensorBuffers()
+    buffers = watchpat_analysis.SensorBuffers()
     waveform_samples = Counter()
     event_records = Counter()
     body_positions = Counter()
     metric_values = []
-    current_time = [1.0]
 
-    with mock.patch.object(watchpat_gui.time, "time", side_effect=lambda: current_time[0]):
-        for idx, raw in enumerate(read_dat_file(path)):
-            current_time[0] = float(idx + 1)
-            payload = _normalize_data_payload(raw)
-            pkt = parse_data_packet(payload, idx)
-            for wf in pkt.waveforms:
-                waveform_samples[wf.channel_name] += len(wf.samples)
-            if pkt.motion is not None:
-                label = watchpat_gui.POSITION_LABELS.get(
-                    pkt.motion.body_position, pkt.motion.body_position)
-                body_positions[label] += 1
-            if pkt.metric is not None:
-                metric_values.append(pkt.metric.value)
-            for event in pkt.events:
-                event_records[event.kind.name] += 1
-            buffers.feed(pkt)
+    for idx, raw in enumerate(read_dat_file(path)):
+        fake_now = float(idx + 1)
+        payload = _normalize_data_payload(raw)
+        pkt = parse_data_packet(payload, idx)
+        for wf in pkt.waveforms:
+            waveform_samples[wf.channel_name] += len(wf.samples)
+        if pkt.motion is not None:
+            label = watchpat_analysis.POSITION_LABELS.get(
+                pkt.motion.body_position, pkt.motion.body_position)
+            body_positions[label] += 1
+        if pkt.metric is not None:
+            metric_values.append(pkt.metric.value)
+        for event in pkt.events:
+            event_records[event.kind.name] += 1
+        buffers.feed(pkt, now=fake_now)
 
-        if buffers.packet_count > 0:
-            current_time[0] = float(buffers.packet_count + 1)
-            with buffers.lock:
-                buffers._last_derive_time = 0.0
-                buffers._update_derived()
+    if buffers.packet_count > 0:
+        with buffers.lock:
+            buffers._last_derive_time = 0.0
+            buffers._update_derived(now=float(buffers.packet_count + 1))
 
     hr_values = [v for v in buffers.hr_history if not math.isnan(v)]
     spo2_values = [v for v in buffers.spo2_full_history if not math.isnan(v)]
@@ -177,15 +168,15 @@ def _metric_rows(left: RecordingSummary, right: RecordingSummary):
          f"{right.apnea_events - left.apnea_events:+d}"),
         ("Central events", str(left.central_events), str(right.central_events),
          f"{right.central_events - left.central_events:+d}"),
-        ("PAT apnea", str(left.pat_event_counts.get(watchpat_gui.EVT_APNEA, 0)),
-         str(right.pat_event_counts.get(watchpat_gui.EVT_APNEA, 0)),
-         f"{right.pat_event_counts.get(watchpat_gui.EVT_APNEA, 0) - left.pat_event_counts.get(watchpat_gui.EVT_APNEA, 0):+d}"),
-        ("PAT hypopnea", str(left.pat_event_counts.get(watchpat_gui.EVT_HYPOPNEA, 0)),
-         str(right.pat_event_counts.get(watchpat_gui.EVT_HYPOPNEA, 0)),
-         f"{right.pat_event_counts.get(watchpat_gui.EVT_HYPOPNEA, 0) - left.pat_event_counts.get(watchpat_gui.EVT_HYPOPNEA, 0):+d}"),
-        ("RERA", str(left.pat_event_counts.get(watchpat_gui.EVT_RERA, 0)),
-         str(right.pat_event_counts.get(watchpat_gui.EVT_RERA, 0)),
-         f"{right.pat_event_counts.get(watchpat_gui.EVT_RERA, 0) - left.pat_event_counts.get(watchpat_gui.EVT_RERA, 0):+d}"),
+        ("PAT apnea", str(left.pat_event_counts.get(watchpat_analysis.EVT_APNEA, 0)),
+         str(right.pat_event_counts.get(watchpat_analysis.EVT_APNEA, 0)),
+         f"{right.pat_event_counts.get(watchpat_analysis.EVT_APNEA, 0) - left.pat_event_counts.get(watchpat_analysis.EVT_APNEA, 0):+d}"),
+        ("PAT hypopnea", str(left.pat_event_counts.get(watchpat_analysis.EVT_HYPOPNEA, 0)),
+         str(right.pat_event_counts.get(watchpat_analysis.EVT_HYPOPNEA, 0)),
+         f"{right.pat_event_counts.get(watchpat_analysis.EVT_HYPOPNEA, 0) - left.pat_event_counts.get(watchpat_analysis.EVT_HYPOPNEA, 0):+d}"),
+        ("RERA", str(left.pat_event_counts.get(watchpat_analysis.EVT_RERA, 0)),
+         str(right.pat_event_counts.get(watchpat_analysis.EVT_RERA, 0)),
+         f"{right.pat_event_counts.get(watchpat_analysis.EVT_RERA, 0) - left.pat_event_counts.get(watchpat_analysis.EVT_RERA, 0):+d}"),
         ("Mean HR", _format_float(left.hr_mean), _format_float(right.hr_mean),
          _format_delta(left.hr_mean, right.hr_mean)),
         ("Max HR", _format_float(left.hr_max), _format_float(right.hr_max),
