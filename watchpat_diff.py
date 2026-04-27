@@ -42,6 +42,8 @@ class RecordingSummary:
     apnea_events: int = 0
     central_events: int = 0
     pat_event_counts: dict[str, int] = field(default_factory=dict)
+    sleep_stage_percentages: dict[str, float] = field(default_factory=dict)
+    sleep_stage_counts: dict[str, int] = field(default_factory=dict)
 
 
 def _normalize_data_payload(raw: bytes) -> bytes:
@@ -101,11 +103,14 @@ def summarize_dat_file(path: str) -> RecordingSummary:
     if buffers.packet_count > 0:
         with buffers.lock:
             buffers._last_derive_time = 0.0
-            buffers._update_derived(now=float(buffers.packet_count + 1))
+            buffers._update_derived(
+                now=float(buffers.packet_count + 1), record_history=False)
 
     hr_values = [v for v in buffers.hr_history if not math.isnan(v)]
     spo2_values = [v for v in buffers.spo2_full_history if not math.isnan(v)]
     pat_event_counts = Counter(ev[4] for ev in buffers.pat_events)
+    sleep_stage_percentages = buffers.sleep_stage_percentages()
+    sleep_stage_counts = Counter(buffers.sleep_stage_label_history)
 
     return RecordingSummary(
         path=path,
@@ -129,6 +134,11 @@ def summarize_dat_file(path: str) -> RecordingSummary:
         apnea_events=len(buffers.apnea_events),
         central_events=len(buffers.central_events),
         pat_event_counts=dict(sorted(pat_event_counts.items())),
+        sleep_stage_percentages=sleep_stage_percentages,
+        sleep_stage_counts={
+            stage: sleep_stage_counts.get(stage, 0)
+            for stage in watchpat_analysis.SLEEP_STAGE_ORDER
+        },
     )
 
 
@@ -145,7 +155,7 @@ def _format_delta(a: Optional[float], b: Optional[float], digits: int = 2) -> st
 
 
 def _metric_rows(left: RecordingSummary, right: RecordingSummary):
-    return [
+    rows = [
         ("Packets", str(left.packet_count), str(right.packet_count),
          f"{right.packet_count - left.packet_count:+d}"),
         ("Duration (min)", _format_float(left.duration_seconds / 60.0),
@@ -188,6 +198,16 @@ def _metric_rows(left: RecordingSummary, right: RecordingSummary):
         ("Metric mean", _format_float(left.metric_mean), _format_float(right.metric_mean),
          _format_delta(left.metric_mean, right.metric_mean)),
     ]
+    for stage in watchpat_analysis.SLEEP_STAGE_ORDER:
+        left_pct = left.sleep_stage_percentages.get(stage)
+        right_pct = right.sleep_stage_percentages.get(stage)
+        rows.append((
+            f"{stage} (%)",
+            _format_float(left_pct, 1),
+            _format_float(right_pct, 1),
+            _format_delta(left_pct, right_pct, 1),
+        ))
+    return rows
 
 
 def format_comparison(left: RecordingSummary, right: RecordingSummary) -> str:
@@ -214,6 +234,10 @@ def format_comparison(left: RecordingSummary, right: RecordingSummary) -> str:
         "Body position:",
         f"  Left : {_dominant_position(left.body_positions)}",
         f"  Right: {_dominant_position(right.body_positions)}",
+        "",
+        "Sleep stages (% of recording):",
+        f"  Left : {left.sleep_stage_percentages}",
+        f"  Right: {right.sleep_stage_percentages}",
     ])
     return "\n".join(lines)
 

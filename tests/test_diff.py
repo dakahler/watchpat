@@ -24,6 +24,7 @@ class TestWatchpatDiff(unittest.TestCase):
         self.assertIn("PAT", summary.waveform_samples)
         self.assertIn("OxiA", summary.waveform_samples)
         self.assertIsNotNone(summary.metric_mean)
+        self.assertIn("Awake", summary.sleep_stage_percentages)
 
     def test_format_comparison_shows_zero_delta_for_same_file(self):
         left = watchpat_diff.summarize_dat_file(TESTDATA)
@@ -34,8 +35,10 @@ class TestWatchpatDiff(unittest.TestCase):
         self.assertIn("AHI (/hr)", rendered)
         self.assertIn("pAHI (/hr)", rendered)
         self.assertIn("pRDI (/hr)", rendered)
+        self.assertIn("Awake (%)", rendered)
         self.assertIn("Waveform samples:", rendered)
         self.assertIn("Body position:", rendered)
+        self.assertIn("Sleep stages (% of recording):", rendered)
         self.assertIn("+0.00", rendered)
 
 

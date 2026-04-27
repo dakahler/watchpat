@@ -36,6 +36,9 @@ class TestMqttPayloadHelpers(unittest.TestCase):
         self.assertIn("prdi", payload)
         self.assertIn("mean_spo2", payload)
         self.assertIn("mean_hr_bpm", payload)
+        self.assertIn("sleep_stage_percentages", payload)
+        self.assertIn("awake_pct", payload)
+        self.assertIn("rem_pct", payload)
         self.assertEqual(payload["packet_count"], 15)
 
     def test_parse_args_defaults_to_primary_topic_without_retain(self):
@@ -54,6 +57,8 @@ class TestMqttPayloadHelpers(unittest.TestCase):
         topic, payload = messages[0]
         self.assertTrue(topic.startswith("homeassistant/sensor/watchpat_test_summary/"))
         self.assertIn('"state_topic": "watchpat/analysis/test"', payload)
+        rendered = "\n".join(body for _, body in messages)
+        self.assertIn('"unique_id": "watchpat_test_summary_awake_pct"', rendered)
 
 
 if __name__ == "__main__":

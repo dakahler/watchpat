@@ -41,6 +41,23 @@ EVT_RERA     = "RERA"
 EVT_PAT      = "PAT"
 EVT_CENTRAL  = "CENTRAL"
 
+SLEEP_STAGE_AWAKE = "Awake"
+SLEEP_STAGE_LIGHT = "Light"
+SLEEP_STAGE_DEEP = "Deep"
+SLEEP_STAGE_REM = "REM"
+SLEEP_STAGE_ORDER = [
+    SLEEP_STAGE_AWAKE,
+    SLEEP_STAGE_LIGHT,
+    SLEEP_STAGE_DEEP,
+    SLEEP_STAGE_REM,
+]
+SLEEP_STAGE_LEVELS = {
+    SLEEP_STAGE_DEEP: 0,
+    SLEEP_STAGE_LIGHT: 1,
+    SLEEP_STAGE_REM: 2,
+    SLEEP_STAGE_AWAKE: 3,
+}
+
 
 # ---------------------------------------------------------------------------
 # Signal-processing helpers (used internally by SensorBuffers)
@@ -136,6 +153,44 @@ def _compute_spo2_pair(red: np.ndarray, ir: np.ndarray, bpm: float,
     return -1.0, ratio
 
 
+def _compute_motion_level(ax: deque, ay: deque, az: deque) -> float:
+    n = min(len(ax), len(ay), len(az), MOTION_RATE * 10)
+    if n < 4:
+        return -1.0
+    x = np.asarray(list(ax)[-n:], dtype=float)
+    y = np.asarray(list(ay)[-n:], dtype=float)
+    z = np.asarray(list(az)[-n:], dtype=float)
+    deltas = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2 + np.diff(z) ** 2)
+    if len(deltas) == 0:
+        return -1.0
+    return float(np.mean(deltas))
+
+
+def _compute_resp_features(samples: np.ndarray, rate: int) -> tuple[float, float, float]:
+    n = min(len(samples), rate * 10)
+    if n < rate * 4:
+        return -1.0, -1.0, -1.0
+    window = samples[-n:].astype(float)
+    smooth_win = max(3, rate // 2)
+    kernel = np.ones(smooth_win) / smooth_win
+    baseline = np.convolve(window, kernel, mode="same")
+    detrended = window - baseline
+    amp = float(np.percentile(detrended, 90) - np.percentile(detrended, 10))
+    if amp <= 0:
+        return -1.0, -1.0, -1.0
+    signs = detrended >= 0
+    crossings = int(np.count_nonzero(signs[1:] != signs[:-1]))
+    duration_s = n / float(rate)
+    bpm = (crossings / 2.0) * 60.0 / duration_s if duration_s > 0 else -1.0
+    if bpm < 4.0 or bpm > 40.0:
+        bpm = -1.0
+    env_win = max(3, rate)
+    envelope = np.convolve(np.abs(detrended), np.ones(env_win) / env_win, mode="same")
+    env_mean = float(np.mean(envelope))
+    variability = float(np.std(envelope) / env_mean) if env_mean > 1e-6 else -1.0
+    return bpm, amp, variability
+
+
 # ---------------------------------------------------------------------------
 # Thread-safe data buffer
 # ---------------------------------------------------------------------------
@@ -166,6 +221,17 @@ class SensorBuffers:
         self._spo2_score_ba = 0.0
         self._spo2_raw = deque(maxlen=15)
         self._spo2_ema = -1.0
+        self.hr_full_history: deque = deque(maxlen=4 * 3600)
+        self.hr_full_times: deque = deque(maxlen=4 * 3600)
+        self.motion_level_history: deque = deque(maxlen=4 * 3600)
+        self.motion_level_times: deque = deque(maxlen=4 * 3600)
+        self.resp_rate_history: deque = deque(maxlen=4 * 3600)
+        self.resp_amp_history: deque = deque(maxlen=4 * 3600)
+        self.resp_variability_history: deque = deque(maxlen=4 * 3600)
+        self.sleep_stage_history: deque = deque(maxlen=4 * 3600)
+        self.sleep_stage_times: deque = deque(maxlen=4 * 3600)
+        self.sleep_stage_label_history: deque = deque(maxlen=4 * 3600)
+        self.current_sleep_stage = SLEEP_STAGE_AWAKE
 
         self.body_position = "?"
         self.body_position_label = "Unknown"
@@ -238,7 +304,104 @@ class SensorBuffers:
                 self._last_derive_time = now
                 self._update_derived(now=now)
 
-    def _update_derived(self, now: float = None):
+    def _valid_recent(self, values: deque, limit: int) -> np.ndarray:
+        arr = np.asarray(list(values)[-limit:], dtype=float)
+        if arr.size == 0:
+            return np.array([])
+        return arr[~np.isnan(arr)]
+
+    def _estimate_sleep_stage(
+        self,
+        motion_level: float,
+        resp_variability: float,
+        pat_ratio: float,
+    ) -> str:
+        if len(self.hr_full_history) < 30:
+            return SLEEP_STAGE_AWAKE
+
+        recent_hr = self._valid_recent(self.hr_full_history, 30)
+        recent_motion = self._valid_recent(self.motion_level_history, 30)
+        recent_resp_var = self._valid_recent(self.resp_variability_history, 30)
+        recent_spo2 = self._valid_recent(self.spo2_full_history, 30)
+        recent_pat = self._valid_recent(self.pat_amp_history, 30)
+        long_hr = self._valid_recent(self.hr_full_history, 600)
+        long_motion = self._valid_recent(self.motion_level_history, 600)
+        long_resp_var = self._valid_recent(self.resp_variability_history, 600)
+        long_pat = self._valid_recent(self.pat_amp_history, 600)
+
+        if recent_hr.size < 10 or recent_motion.size < 10:
+            return SLEEP_STAGE_AWAKE
+
+        hr_now = float(np.mean(recent_hr[-10:]))
+        hr_std = float(np.std(recent_hr[-30:])) if recent_hr.size >= 5 else 0.0
+        hr_low = float(np.percentile(long_hr, 35)) if long_hr.size else hr_now
+        hr_high = float(np.percentile(long_hr, 70)) if long_hr.size else hr_now
+        motion_now = float(np.mean(recent_motion[-10:]))
+        motion_low = (
+            float(np.percentile(long_motion, 35)) if long_motion.size else motion_now
+        )
+        motion_high = (
+            float(np.percentile(long_motion, 75)) if long_motion.size else motion_now
+        )
+        resp_now = (
+            float(np.mean(recent_resp_var[-10:])) if recent_resp_var.size else resp_variability
+        )
+        pat_now = float(np.mean(recent_pat[-10:])) if recent_pat.size else pat_ratio
+        resp_low = (
+            float(np.percentile(long_resp_var, 35)) if long_resp_var.size else resp_now
+        )
+        resp_high = (
+            float(np.percentile(long_resp_var, 70)) if long_resp_var.size else resp_now
+        )
+        pat_low = float(np.percentile(long_pat, 30)) if long_pat.size else pat_now
+        pat_high = float(np.percentile(long_pat, 70)) if long_pat.size else pat_now
+        spo2_drop = 0.0
+        if recent_spo2.size:
+            spo2_drop = float(max(0.0, np.max(recent_spo2) - np.min(recent_spo2)))
+
+        if motion_now >= max(2.6, motion_high * 1.35):
+            return SLEEP_STAGE_AWAKE
+        if hr_std >= 6.0 and motion_now > max(1.8, motion_low * 1.15):
+            return SLEEP_STAGE_AWAKE
+        deep_support = (
+            hr_std <= 2.8
+            or resp_now <= resp_low
+            or pat_now >= pat_high
+        )
+        if (
+            motion_now <= max(1.35, motion_low * 1.02)
+            and hr_now <= hr_low + 1.5
+            and deep_support
+            and spo2_drop < 1.5
+        ):
+            return SLEEP_STAGE_DEEP
+        rem_score = 0
+        if hr_now >= hr_high:
+            rem_score += 1
+        if hr_std >= 3.5:
+            rem_score += 1
+        if resp_now >= resp_high:
+            rem_score += 1
+        if pat_now > 0 and pat_now <= pat_low:
+            rem_score += 1
+        if motion_now <= max(1.8, motion_low * 1.2) and rem_score >= 2:
+            return SLEEP_STAGE_REM
+        return SLEEP_STAGE_LIGHT
+
+    def sleep_stage_percentages(self) -> dict[str, float]:
+        total = len(self.sleep_stage_label_history)
+        if total <= 0:
+            return {stage: 0.0 for stage in SLEEP_STAGE_ORDER}
+        counts = {
+            stage: sum(1 for value in self.sleep_stage_label_history if value == stage)
+            for stage in SLEEP_STAGE_ORDER
+        }
+        return {
+            stage: round((100.0 * counts[stage]) / total, 1)
+            for stage in SLEEP_STAGE_ORDER
+        }
+
+    def _update_derived(self, now: float = None, record_history: bool = True):
         """Compute HR and SpO2 from current buffers (called with lock held)."""
         if now is None:
             now = time.time()
@@ -301,9 +464,16 @@ class SensorBuffers:
             self.spo2_history.append(float("nan"))
 
         elapsed = now - self.start_time if self.start_time else 0.0
+        motion_level = _compute_motion_level(
+            self.accel_x, self.accel_y, self.accel_z)
+        chest_arr = np.array(self.chest) if len(self.chest) >= WAVEFORM_RATE * 4 else np.array([])
+        resp_rate, resp_amp, resp_variability = _compute_resp_features(
+            chest_arr, WAVEFORM_RATE) if len(chest_arr) else (-1.0, -1.0, -1.0)
+        pat_ratio = -1.0
         if self.current_spo2 > 0:
-            self.spo2_full_history.append(self.current_spo2)
-            self.spo2_full_times.append(elapsed)
+            if record_history:
+                self.spo2_full_history.append(self.current_spo2)
+                self.spo2_full_times.append(elapsed)
             if not self._desat_in_event:
                 self._desat_baseline.append(self.current_spo2)
             if len(self._desat_baseline) >= 30:
@@ -341,8 +511,10 @@ class SensorBuffers:
                     pat_baseline = float(
                         np.percentile(list(self._pat_baseline_buf), 75))
                     ratio = env / pat_baseline if pat_baseline > 0 else 1.0
-                    self.pat_amp_history.append(ratio * 100.0)
-                    self.pat_amp_times.append(elapsed)
+                    pat_ratio = ratio * 100.0
+                    if record_history:
+                        self.pat_amp_history.append(pat_ratio)
+                        self.pat_amp_times.append(elapsed)
                     if not self._pat_in_event:
                         if ratio <= 0.70:
                             self._pat_in_event = True
@@ -390,6 +562,26 @@ class SensorBuffers:
             self.pahi_estimate = (n_apnea + n_hyp) / hours
             self.rdi_estimate  = (n_apnea + n_hyp + n_rera) / hours
 
+        if record_history:
+            self.hr_full_history.append(hr if hr > 0 else float("nan"))
+            self.hr_full_times.append(elapsed)
+            self.motion_level_history.append(
+                motion_level if motion_level >= 0 else float("nan"))
+            self.motion_level_times.append(elapsed)
+            self.resp_rate_history.append(resp_rate if resp_rate > 0 else float("nan"))
+            self.resp_amp_history.append(resp_amp if resp_amp > 0 else float("nan"))
+            self.resp_variability_history.append(
+                resp_variability if resp_variability >= 0 else float("nan"))
+            stage = self._estimate_sleep_stage(
+                motion_level=motion_level,
+                resp_variability=resp_variability,
+                pat_ratio=pat_ratio,
+            )
+            self.current_sleep_stage = stage
+            self.sleep_stage_label_history.append(stage)
+            self.sleep_stage_history.append(SLEEP_STAGE_LEVELS[stage])
+            self.sleep_stage_times.append(elapsed)
+
     def _waveform_buf(self, name: str):
         return {"OxiA": self.oxi_a, "OxiB": self.oxi_b,
                 "PAT": self.pat, "Chest": self.chest}.get(name)
@@ -433,4 +625,26 @@ class SensorBuffers:
                 "pahi_estimate": self.pahi_estimate,
                 "rdi_estimate": self.rdi_estimate,
                 "central_events": list(self.central_events),
+                "hr_full_history": (np.array(self.hr_full_history)
+                                    if self.hr_full_history else np.array([])),
+                "hr_full_times": (np.array(self.hr_full_times)
+                                  if self.hr_full_times else np.array([])),
+                "motion_level_history": (np.array(self.motion_level_history)
+                                         if self.motion_level_history else np.array([])),
+                "motion_level_times": (np.array(self.motion_level_times)
+                                       if self.motion_level_times else np.array([])),
+                "resp_rate_history": (np.array(self.resp_rate_history)
+                                      if self.resp_rate_history else np.array([])),
+                "resp_amp_history": (np.array(self.resp_amp_history)
+                                     if self.resp_amp_history else np.array([])),
+                "resp_variability_history": (
+                    np.array(self.resp_variability_history)
+                    if self.resp_variability_history else np.array([])),
+                "sleep_stage_history": (np.array(self.sleep_stage_history)
+                                        if self.sleep_stage_history else np.array([])),
+                "sleep_stage_times": (np.array(self.sleep_stage_times)
+                                      if self.sleep_stage_times else np.array([])),
+                "sleep_stage_labels": list(self.sleep_stage_label_history),
+                "sleep_stage_percentages": self.sleep_stage_percentages(),
+                "current_sleep_stage": self.current_sleep_stage,
             }

@@ -25,6 +25,8 @@ class TestAndroidAnalysis(unittest.TestCase):
         self.assertEqual(payload["summary"]["packet_count"], 15)
         self.assertIn("mean_spo2", payload["summary"])
         self.assertIn("ahi", payload["summary"])
+        self.assertIn("sleep_stage_percentages", payload["summary"])
+        self.assertIn("awake_pct", payload["summary"])
 
 
 if __name__ == "__main__":

@@ -99,6 +99,43 @@ class TestWatchPATDashboard(unittest.TestCase):
         self.assertIn("pRDI:        3.0 /hr", stats_text)
         self.assertIn("Central:          1", stats_text)
 
+    def test_update_renders_sleep_stage_overlay_and_percentages(self):
+        with self.buffers.lock:
+            self.buffers.sleep_stage_times.extend([60.0, 120.0, 180.0, 240.0])
+            self.buffers.sleep_stage_history.extend([3, 1, 0, 2])
+            self.buffers.sleep_stage_label_history.extend(
+                ["Awake", "Light", "Deep", "REM"])
+            self.buffers.current_sleep_stage = "REM"
+
+        self.dashboard.update(frame=0)
+
+        self.assertEqual(len(self.dashboard.sleep_stage_line.get_xdata()), 4)
+        self.assertEqual(self.dashboard.stage_strip_image.get_array().shape[0], 1)
+        stats_text = self.dashboard.stats_text.get_text()
+        self.assertIn("Stage:          REM", stats_text)
+        self.assertIn("Stages %:  A 25.0 L 25.0 D 25.0 R 25.0", stats_text)
+        legend_texts = [text.get_text() for text in self.dashboard.ax_apnea.texts]
+        self.assertIn("SpO2 line", legend_texts)
+        self.assertIn("Gray bars = respiratory events / 5 min", legend_texts)
+        self.assertIn("Stages:", legend_texts)
+
+    def test_update_smooths_long_apnea_panel_traces(self):
+        with self.buffers.lock:
+            self.buffers.start_time = time.time() - 3600
+            for idx in range(1500):
+                self.buffers.spo2_full_times.append(float(idx))
+                self.buffers.spo2_full_history.append(90.0 + (idx % 7))
+                self.buffers.pat_events.append(
+                    (float(idx), 0.5, 5.0, 3.5, watchpat_gui.EVT_HYPOPNEA))
+
+        self.dashboard.update(frame=0)
+
+        self.assertLess(len(self.dashboard.spo2_full_line.get_xdata()), 1000)
+        visible_bars = sum(
+            1 for patch in self.dashboard.event_bar_patches if patch.get_visible()
+        )
+        self.assertGreater(visible_bars, 0)
+
     def test_update_ahi_color_thresholds_follow_pahi_severity(self):
         cases = [
             (4.9, "#2ecc71"),
@@ -120,6 +157,7 @@ class TestWatchPATDashboard(unittest.TestCase):
     def test_replay_scrubber_seek_updates_dashboard_buffer(self):
         controller = mock.Mock()
         controller.buffers = watchpat_gui.SensorBuffers()
+        controller.full_buffers = watchpat_gui.SensorBuffers()
         controller.current_index = 3
         controller.packet_count = 10
         controller.paused = True
@@ -136,6 +174,7 @@ class TestWatchPATDashboard(unittest.TestCase):
     def test_replay_update_advances_controller_and_syncs_slider(self):
         controller = mock.Mock()
         controller.buffers = self.buffers
+        controller.full_buffers = self.buffers
         controller.current_index = 4
         controller.packet_count = 12
         controller.paused = False
@@ -148,6 +187,11 @@ class TestWatchPATDashboard(unittest.TestCase):
         controller.advance.assert_called_once()
         self.assertEqual(self.dashboard.replay_slider.val, 4)
         self.assertGreater(len(artists), 0)
+        self.assertIn("Elapsed:      0m 04s", self.dashboard.stats_text.get_text())
+        self.assertLess(
+            self.dashboard.replay_slider.ax.get_position().y1,
+            self.dashboard.ax_apnea.get_position().y0,
+        )
 
     def test_event_markers_reset_when_scrubbing_backwards(self):
         with self.buffers.lock:
@@ -307,8 +351,21 @@ class TestApneaClassification(unittest.TestCase):
         buf = watchpat_gui.SensorBuffers()
         snap = buf.snapshot()
         for key in ("pat_amp_history", "pat_amp_times", "pat_events",
-                    "pahi_estimate", "rdi_estimate", "central_events"):
+                    "pahi_estimate", "rdi_estimate", "central_events",
+                    "sleep_stage_history", "sleep_stage_times",
+                    "sleep_stage_percentages", "current_sleep_stage"):
             self.assertIn(key, snap, msg=f"snapshot missing: {key}")
+
+    def test_sleep_stage_percentages_are_reported(self):
+        buf = watchpat_gui.SensorBuffers()
+        with buf.lock:
+            buf.sleep_stage_label_history.extend(
+                ["Awake", "Awake", "Light", "Deep", "REM"])
+        snap = buf.snapshot()
+        self.assertEqual(snap["sleep_stage_percentages"]["Awake"], 40.0)
+        self.assertEqual(snap["sleep_stage_percentages"]["Light"], 20.0)
+        self.assertEqual(snap["sleep_stage_percentages"]["Deep"], 20.0)
+        self.assertEqual(snap["sleep_stage_percentages"]["REM"], 20.0)
 
     # ------------------------------------------------------------------
     # PAT event type classification

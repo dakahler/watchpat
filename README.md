@@ -21,6 +21,7 @@ The BLE protocol and binary data format were reverse-engineered from the WatchPA
 - **Raw capture** to length-prefixed `.dat` files for offline analysis
 - **Offline replay** and **CSV export** of all decoded channels
 - **Estimated sleep-event metrics** including ODI-style `AHI`, PAT-based `pAHI`, `pRDI`, and central-event counts during replay/analysis
+- **Heuristic sleep staging** with per-recording `Awake` / `Light` / `Deep` / `REM` percentages and a unified full-night stage graph in the GUI
 - **Capture comparison tool** for diffing two `.dat` files and reporting metric deltas such as `AHI` / `pAHI`
 - **MQTT summary publishing** for final analysis results, with Home Assistant MQTT Discovery support
 
@@ -107,7 +108,7 @@ python watchpat_diff.py baseline.dat followup.dat --json
 python watchpat_mqtt_test.py --input-dat tests/testdata2.dat --server 192.168.1.150 --username watchpat --password watchpat1 --retain
 ```
 
-### AHI and Related Metrics
+### AHI, Sleep Stages, and Related Metrics
 
 During replay and offline analysis the project derives a few sleep-event estimates from the raw WatchPAT signals:
 
@@ -115,20 +116,25 @@ During replay and offline analysis the project derives a few sleep-event estimat
 - `pAHI` is a PAT-based estimate that counts `APNEA` and `HYPOPNEA` events per hour.
 - `pRDI` extends `pAHI` by also counting `RERA` events per hour.
 - `Central` events are desaturations with no nearby PAT attenuation and are tracked separately.
+- Sleep stages are estimated heuristically from the available motion, heart-rate, PAT-amplitude, and respiratory-effort signals and labeled as `Awake`, `Light`, `Deep`, or `REM`.
 
-These values appear in the GUI replay dashboard session stats, and `watchpat_diff.py` reports the summary for two recordings side by side with deltas.
+These values appear in:
 
-The AHI-related values here are heuristic estimates derived from reverse-engineered signal processing in this repo. They are useful for comparing captures and validating pipeline behavior, but they are not a substitute for the vendor software or a clinical scoring workflow.
+- the GUI replay dashboard session stats plus the unified full-night sleep-stage graph
+- `watchpat_diff.py`, which reports stage percentages and other metrics side by side with deltas
+- MQTT summaries, which publish `% of total recording` for each estimated sleep stage
+
+The AHI-related values and sleep-stage labels here are heuristic estimates derived from reverse-engineered signal processing in this repo. They are useful for comparing captures and validating pipeline behavior, but they are not a substitute for the vendor software, polysomnography staging, or a clinical scoring workflow.
 
 ### MQTT and Home Assistant
 
-The project can publish final analysis summaries over MQTT as a single JSON payload containing values such as `AHI`, `pAHI`, `pRDI`, mean/min `SpO2`, heart-rate stats, and event counts.
+The project can publish final analysis summaries over MQTT as a single JSON payload containing values such as `AHI`, `pAHI`, `pRDI`, mean/min `SpO2`, heart-rate stats, event counts, and sleep-stage percentages.
 
 - `watchpat_mqtt_test.py` is a Python integration check which analyzes a `.dat` file, publishes the final summary to MQTT, and verifies the broker echoes the retained payload back.
 - By default the test script publishes state to `watchpat/analysis/test` and publishes Home Assistant MQTT Discovery config under the `homeassistant/` prefix.
 - The Android app publishes retained summary state to `watchpat/analysis` and also publishes Home Assistant MQTT Discovery config automatically.
 
-If Home Assistant MQTT Discovery is enabled and connected to the same broker, the published discovery config should create entities automatically for summary metrics like `AHI`, `pAHI`, `pRDI`, mean `SpO2`, and mean heart rate.
+If Home Assistant MQTT Discovery is enabled and connected to the same broker, the published discovery config should create entities automatically for summary metrics like `AHI`, `pAHI`, `pRDI`, mean `SpO2`, mean heart rate, and the `Awake` / `Light` / `Deep` / `REM` percentages.
 
 ## Tests
 

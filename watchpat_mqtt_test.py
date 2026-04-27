@@ -31,6 +31,10 @@ DISCOVERY_FIELDS = [
     ("ahi", "AHI", "/hr", "measurement"),
     ("pahi", "pAHI", "/hr", "measurement"),
     ("prdi", "pRDI", "/hr", "measurement"),
+    ("awake_pct", "Awake", "%", "measurement"),
+    ("light_pct", "Light", "%", "measurement"),
+    ("deep_pct", "Deep", "%", "measurement"),
+    ("rem_pct", "REM", "%", "measurement"),
     ("mean_spo2", "Mean SpO2", "%", "measurement"),
     ("min_spo2", "Min SpO2", "%", "measurement"),
     ("mean_hr_bpm", "Mean HR", "bpm", "measurement"),
@@ -59,6 +63,7 @@ def normalize_server_uri(raw: str) -> tuple[str, int]:
 
 
 def build_summary_payload(summary: RecordingSummary) -> dict:
+    stage_percentages = summary.sleep_stage_percentages
     return {
         "recording_path": summary.path,
         "packet_count": summary.packet_count,
@@ -75,6 +80,11 @@ def build_summary_payload(summary: RecordingSummary) -> dict:
         "min_spo2": summary.spo2_min,
         "metric_mean": summary.metric_mean,
         "body_positions": summary.body_positions,
+        "sleep_stage_percentages": stage_percentages,
+        "awake_pct": stage_percentages.get("Awake", 0.0),
+        "light_pct": stage_percentages.get("Light", 0.0),
+        "deep_pct": stage_percentages.get("Deep", 0.0),
+        "rem_pct": stage_percentages.get("REM", 0.0),
     }
 
 
@@ -99,7 +109,12 @@ def build_discovery_messages(state_topic: str, device_id: str = DISCOVERY_DEVICE
             payload["unit_of_measurement"] = unit
         if state_class:
             payload["state_class"] = state_class
-        if field in {"ahi", "pahi", "prdi", "mean_spo2", "min_spo2", "mean_hr_bpm", "max_hr_bpm", "duration_minutes"}:
+        if field in {
+            "ahi", "pahi", "prdi",
+            "awake_pct", "light_pct", "deep_pct", "rem_pct",
+            "mean_spo2", "min_spo2", "mean_hr_bpm", "max_hr_bpm",
+            "duration_minutes",
+        }:
             payload["suggested_display_precision"] = 2
         messages.append((topic, json.dumps(payload, sort_keys=True)))
     return messages

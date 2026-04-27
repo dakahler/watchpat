@@ -65,6 +65,8 @@ from watchpat_analysis import (
     WINDOW_SECONDS, WAVEFORM_RATE, MOTION_RATE, BUFFER_SIZE, MOTION_BUFFER,
     DERIVED_HISTORY, DERIVE_INTERVAL, POSITION_LABELS,
     EVT_APNEA, EVT_HYPOPNEA, EVT_RERA, EVT_PAT, EVT_CENTRAL,
+    SLEEP_STAGE_AWAKE, SLEEP_STAGE_LIGHT, SLEEP_STAGE_DEEP, SLEEP_STAGE_REM,
+    SLEEP_STAGE_LEVELS,
     SensorBuffers,
 )
 
@@ -85,6 +87,33 @@ EVENT_COLORS = {
     EVT_CENTRAL:  "#9b59b6",
 }
 
+SLEEP_STAGE_COLORS = {
+    SLEEP_STAGE_AWAKE: "#ffd84d",
+    SLEEP_STAGE_LIGHT: "#5cc8ff",
+    SLEEP_STAGE_DEEP: "#2ee6a6",
+    SLEEP_STAGE_REM: "#ff73c6",
+}
+
+
+def _smooth_and_downsample(x, y, window: int = 9, max_points: int = 600):
+    if len(x) == 0 or len(y) == 0:
+        return np.array([]), np.array([])
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    valid = ~np.isnan(y_arr)
+    x_arr = x_arr[valid]
+    y_arr = y_arr[valid]
+    if len(x_arr) == 0:
+        return np.array([]), np.array([])
+    if window > 1 and len(y_arr) >= window:
+        kernel = np.ones(window, dtype=float) / float(window)
+        y_arr = np.convolve(y_arr, kernel, mode="same")
+    if len(x_arr) > max_points:
+        step = int(math.ceil(len(x_arr) / float(max_points)))
+        x_arr = x_arr[::step]
+        y_arr = y_arr[::step]
+    return x_arr, y_arr
+
 def _normalize_replay_payload(raw: bytes) -> bytes:
     """Accept either a payload-only capture record or a full BLE packet."""
     if len(raw) >= HEADER_SIZE and raw[:2] == b"\xBB\xBB":
@@ -95,15 +124,25 @@ def _normalize_replay_payload(raw: bytes) -> bytes:
 class ReplayController:
     """Owns replay state so the GUI can seek and scrub arbitrarily."""
 
+    CHECKPOINT_INTERVAL = 300
+
     def __init__(self, path: str, speed: float = 1.0):
         self.path = path
         self.speed = speed
         self._playhead = 0.0
         self._paused = speed <= 0
         self.packets: list[ParsedDataPacket] = []
+        self.checkpoints: dict[int, SensorBuffers] = {0: SensorBuffers()}
+        checkpoint_builder = SensorBuffers()
         for idx, raw in enumerate(read_dat_file(path)):
             payload = _normalize_replay_payload(raw)
-            self.packets.append(parse_data_packet(payload, idx))
+            pkt = parse_data_packet(payload, idx)
+            self.packets.append(pkt)
+            checkpoint_builder.feed(pkt, now=float(idx + 1))
+            next_index = idx + 1
+            if next_index % self.CHECKPOINT_INTERVAL == 0:
+                self.checkpoints[next_index] = checkpoint_builder.clone()
+        self.full_buffers = checkpoint_builder.clone()
         self.buffers = SensorBuffers()
         self.current_index = 0
         if speed <= 0 and self.packets:
@@ -123,8 +162,10 @@ class ReplayController:
 
     def seek(self, target_index: int):
         target_index = max(0, min(int(target_index), self.packet_count))
-        new_buffers = SensorBuffers()
-        for idx in range(target_index):
+        checkpoint_index = (
+            target_index // self.CHECKPOINT_INTERVAL) * self.CHECKPOINT_INTERVAL
+        new_buffers = self.checkpoints.get(checkpoint_index, SensorBuffers()).clone()
+        for idx in range(checkpoint_index, target_index):
             new_buffers.feed(self.packets[idx], now=float(idx + 1))
         self.buffers = new_buffers
         self.current_index = target_index
@@ -352,12 +393,9 @@ class WatchPATDashboard:
             color="#95a5a6",
         )
 
-        # -- Apnea / PAT Events Timeline (row 6, full width) --
+        # -- Sleep overview timeline (row 6, full width) --
         self.ax_apnea = self.fig.add_subplot(gs[6, :])
         self.ax_apnea.set_facecolor(dark_bg)
-        self.ax_apnea.set_title(
-            "Apnea Events  —  orange: PAT attenuation ≥30%  |  red: SpO₂ drop ≥3%",
-            color=text_color, fontsize=9, fontweight="bold", loc="left", pad=4)
         self.ax_apnea.tick_params(colors=text_color, labelsize=7)
         self.ax_apnea.spines["top"].set_visible(False)
         for spine in self.ax_apnea.spines.values():
@@ -368,43 +406,93 @@ class WatchPATDashboard:
         self.ax_apnea.set_ylabel("SpO₂ (%)", fontsize=7, color="#3498db")
         self.ax_apnea.tick_params(axis="y", colors="#3498db")
         self.ax_apnea.set_title(
-            "Apnea Events  —  "
-            "■ Apnea  ■ Hypopnea  ■ RERA  ■ Central (no PAT)",
+            "Sleep Overview",
             color=text_color, fontsize=9, fontweight="bold", loc="left", pad=4)
         self.spo2_full_line, = self.ax_apnea.plot(
-            [], [], color="#3498db", linewidth=1.0)
-        # Colored legend squares drawn as text spans
-        _legend_x = [0.01, 0.09, 0.19, 0.25]
-        for xpos, color in zip(_legend_x,
-                                [EVENT_COLORS[EVT_APNEA],
-                                 EVENT_COLORS[EVT_HYPOPNEA],
-                                 EVENT_COLORS[EVT_RERA],
-                                 EVENT_COLORS[EVT_CENTRAL]]):
-            self.ax_apnea.text(xpos, 0.97, "■", ha="left", va="top",
-                               color=color, fontsize=9,
-                               transform=self.ax_apnea.transAxes)
-        # Per-type event line tracking (incremental, never removed)
-        self._evt_lines: dict[str, list] = {t: [] for t in EVENT_COLORS}
+            [], [], color="#5dade2", linewidth=1.8, alpha=0.95)
+        self.ax_apnea.text(
+            0.01, 0.97, "SpO2 line",
+            ha="left", va="top", color="#5dade2", fontsize=8,
+            transform=self.ax_apnea.transAxes)
+        self.ax_apnea.text(
+            0.13, 0.97, "Gray bars = respiratory events / 5 min",
+            ha="left", va="top", color=text_color, fontsize=8,
+            transform=self.ax_apnea.transAxes)
+        self.ax_apnea.text(
+            0.44, 0.97, "Stages:",
+            ha="left", va="top", color=text_color, fontsize=8,
+            transform=self.ax_apnea.transAxes)
+        stage_legend = [
+            (0.50, "Awake", SLEEP_STAGE_COLORS[SLEEP_STAGE_AWAKE]),
+            (0.59, "Light", SLEEP_STAGE_COLORS[SLEEP_STAGE_LIGHT]),
+            (0.67, "Deep", SLEEP_STAGE_COLORS[SLEEP_STAGE_DEEP]),
+            (0.75, "REM", SLEEP_STAGE_COLORS[SLEEP_STAGE_REM]),
+        ]
+        for xpos, label, color in stage_legend:
+            self.ax_apnea.text(
+                xpos, 0.97, "■",
+                ha="left", va="top", color=color, fontsize=9,
+                transform=self.ax_apnea.transAxes)
+            self.ax_apnea.text(
+                xpos + 0.012, 0.97, label,
+                ha="left", va="top", color=text_color, fontsize=8,
+                transform=self.ax_apnea.transAxes)
         self._drawn_evt_count: dict[str, int] = {t: 0 for t in EVENT_COLORS}
+        self.ax_event_burden = self.ax_apnea.twinx()
+        self.ax_event_burden.set_facecolor("none")
+        self.ax_event_burden.set_ylim(0, 8)
+        self.ax_event_burden.set_ylabel("Events / 5 min", fontsize=7,
+                                        color="#f5f6fa")
+        self.ax_event_burden.tick_params(axis="y", colors="#f5f6fa", labelsize=7)
+        self.ax_event_burden.spines["right"].set_color("#f5f6fa")
+        self.ax_event_burden.spines["top"].set_visible(False)
+        self.ax_event_burden.spines["left"].set_visible(False)
+        self.event_bars = self.ax_event_burden.bar(
+            [], [], width=4.2, align="center",
+            color="#c7d0dd", alpha=0.55, linewidth=0)
+        self.event_bar_patches = list(self.event_bars.patches)
 
-        # Secondary y-axis: PAT amplitude as % of rolling baseline
-        self.ax_pat_amp = self.ax_apnea.twinx()
-        self.ax_pat_amp.set_facecolor("none")
-        self.ax_pat_amp.set_ylim(0, 150)
-        self.ax_pat_amp.set_ylabel("PAT amp (% baseline)", fontsize=7,
-                                    color="#2ecc71")
-        self.ax_pat_amp.tick_params(axis="y", colors="#2ecc71", labelsize=7)
-        self.ax_pat_amp.spines["right"].set_color("#2ecc71")
-        self.ax_pat_amp.spines["top"].set_visible(False)
-        self.ax_pat_amp.spines["left"].set_visible(False)
-        self.ax_pat_amp.axhline(y=70, color="#f39c12", linewidth=0.8,
-                                 linestyle="--", alpha=0.7)
-        self.pat_amp_line, = self.ax_pat_amp.plot(
-            [], [], color="#2ecc71", linewidth=0.8, alpha=0.85)
+        self.ax_sleep_stage = self.ax_apnea.twinx()
+        self.ax_sleep_stage.set_facecolor("none")
+        self.ax_sleep_stage.set_ylim(-0.5, 3.5)
+        self.ax_sleep_stage.set_yticks([0, 1, 2, 3])
+        self.ax_sleep_stage.set_yticklabels(
+            ["Deep", "Light", "REM", "Awake"], color="#ecf0f1", fontsize=7)
+        self.ax_sleep_stage.set_ylabel("Sleep stage", fontsize=7, color="#ecf0f1")
+        self.ax_sleep_stage.tick_params(axis="y", colors="#ecf0f1", labelsize=7)
+        self.ax_sleep_stage.spines["right"].set_position(("outward", 42))
+        self.ax_sleep_stage.spines["right"].set_color("#ecf0f1")
+        self.ax_sleep_stage.spines["top"].set_visible(False)
+        self.ax_sleep_stage.spines["left"].set_visible(False)
+        self.ax_sleep_stage.set_facecolor((0, 0, 0, 0))
+        self.sleep_stage_line, = self.ax_sleep_stage.step(
+            [], [], where="post", color="#ffffff", linewidth=2.4, alpha=0.95)
+        self.sleep_stage_line.set_alpha(0.0)
+        self.stage_strip = self.ax_apnea.inset_axes([0.0, 0.00, 1.0, 0.14], sharex=self.ax_apnea)
+        self.stage_strip.set_facecolor("#111827")
+        self.stage_strip.set_ylim(0, 1)
+        self.stage_strip.set_yticks([])
+        self.stage_strip.set_ylabel("Stage", fontsize=7, color="#ecf0f1", labelpad=8)
+        self.stage_strip.tick_params(axis="x", colors=text_color, labelsize=7)
+        self.stage_strip.spines["top"].set_color("#34495e")
+        self.stage_strip.spines["right"].set_visible(False)
+        self.stage_strip.spines["left"].set_color(grid_color)
+        self.stage_strip.spines["bottom"].set_color(grid_color)
+        self.stage_strip_image = self.stage_strip.imshow(
+            np.zeros((1, 1, 4)),
+            extent=[0, 1, 0, 1],
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+        )
+        self.overview_playhead_line = self.ax_apnea.axvline(
+            x=0.0, color="#ecf0f1", linewidth=1.2, alpha=0.85, linestyle="--")
+        self.stage_playhead_line = self.stage_strip.axvline(
+            x=0.0, color="#ecf0f1", linewidth=1.2, alpha=0.85, linestyle="--")
 
         self.ax_apnea_ahi_text = self.ax_apnea.text(
-            0.99, 0.93, "pAHI: --",
-            ha="right", va="top", fontsize=9, fontweight="bold",
+            0.99, 1.05, "pAHI: --",
+            ha="right", va="bottom", fontsize=9, fontweight="bold",
             color="#7f8c8d", transform=self.ax_apnea.transAxes)
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -418,13 +506,24 @@ class WatchPATDashboard:
         """Attach replay controls for seeking through preloaded data."""
         self.replay_controller = controller
         self.buffers = controller.buffers
-        self.fig.subplots_adjust(bottom=0.10)
+        self.fig.subplots_adjust(bottom=0.24)
+
+        apnea_pos = self.ax_apnea.get_position()
+        lifted_pos = [
+            apnea_pos.x0,
+            apnea_pos.y0 + 0.055,
+            apnea_pos.width,
+            apnea_pos.height - 0.010,
+        ]
+        self.ax_apnea.set_position(lifted_pos)
+        self.ax_event_burden.set_position(lifted_pos)
+        self.ax_sleep_stage.set_position(lifted_pos)
 
         dark_bg = "#16213e"
         text_color = "#e0e0e0"
-        slider_ax = self.fig.add_axes([0.10, 0.02, 0.70, 0.03], facecolor=dark_bg)
-        button_ax = self.fig.add_axes([0.82, 0.018, 0.08, 0.04])
-        status_ax = self.fig.add_axes([0.91, 0.016, 0.07, 0.05], facecolor="none")
+        slider_ax = self.fig.add_axes([0.12, 0.010, 0.64, 0.024], facecolor=dark_bg)
+        button_ax = self.fig.add_axes([0.80, 0.004, 0.10, 0.042])
+        status_ax = self.fig.add_axes([0.91, 0.000, 0.08, 0.050], facecolor="none")
         status_ax.axis("off")
 
         max_packet = max(controller.packet_count, 1)
@@ -489,12 +588,26 @@ class WatchPATDashboard:
             )
 
     def _reset_event_lines(self):
-        for lines in self._evt_lines.values():
-            for line in lines:
-                line.remove()
-            lines.clear()
         for evt_type in self._drawn_evt_count:
             self._drawn_evt_count[evt_type] = 0
+
+    def _set_bar_container(self, container, x_values, heights, bottoms):
+        patches = self.event_bar_patches
+        color = patches[0].get_facecolor() if patches else "#ffffff"
+        while len(patches) < len(x_values):
+            extra = self.ax_event_burden.bar(
+                [0], [0], width=4.2, align="center",
+                color=color, alpha=0.55, linewidth=0)
+            patches.extend(extra.patches)
+        for idx, patch in enumerate(patches):
+            if idx < len(x_values):
+                patch.set_x(float(x_values[idx]) - 2.1)
+                patch.set_width(4.2)
+                patch.set_y(float(bottoms[idx]))
+                patch.set_height(float(heights[idx]))
+                patch.set_visible(True)
+            else:
+                patch.set_visible(False)
 
     def update(self, frame):
         """Animation update callback."""
@@ -505,6 +618,15 @@ class WatchPATDashboard:
             self.buffers = self.replay_controller.buffers
             self._sync_replay_controls()
         snap = self.buffers.snapshot()
+        overview_snap = snap
+        overview_total_min = None
+        overview_playhead_min = None
+        if self.replay_controller is not None:
+            full_buffers = getattr(self.replay_controller, "full_buffers", None)
+            if isinstance(full_buffers, SensorBuffers):
+                overview_snap = full_buffers.snapshot()
+            overview_total_min = self.replay_controller.packet_count / 60.0
+            overview_playhead_min = self.replay_controller.current_index / 60.0
 
         # -- Update waveforms --
         for name, key in [("OxiA", "oxi_a"), ("OxiB", "oxi_b"),
@@ -614,13 +736,17 @@ class WatchPATDashboard:
         self.pos_label.set_text(axis_str)
 
         # -- Update apnea / PAT events panel --
-        spo2_times = snap["spo2_full_times"]
-        spo2_full = snap["spo2_full_history"]
+        spo2_times = overview_snap["spo2_full_times"]
+        spo2_full = overview_snap["spo2_full_history"]
         t_max_min = 1.0
         if len(spo2_times) > 0:
             t_min = spo2_times / 60.0
             t_max_min = max(float(t_min[-1]), 1.0)
-            self.spo2_full_line.set_data(t_min, spo2_full)
+            if overview_total_min is not None:
+                t_max_min = max(float(overview_total_min), 1.0)
+            t_min_smooth, spo2_smooth = _smooth_and_downsample(
+                t_min, spo2_full, window=21, max_points=700)
+            self.spo2_full_line.set_data(t_min_smooth, spo2_smooth)
             self.ax_apnea.set_xlim(0, t_max_min)
             valid_spo2 = spo2_full[~np.isnan(spo2_full)]
             if len(valid_spo2) > 0:
@@ -629,40 +755,79 @@ class WatchPATDashboard:
         else:
             self.spo2_full_line.set_data([], [])
 
-        # PAT amplitude trace
-        pat_times = snap["pat_amp_times"]
-        pat_amps = snap["pat_amp_history"]
-        if len(pat_times) > 0:
-            self.pat_amp_line.set_data(pat_times / 60.0, pat_amps)
-            self.ax_pat_amp.set_xlim(0, t_max_min)
+        stage_times = overview_snap["sleep_stage_times"]
+        stage_values = overview_snap["sleep_stage_history"]
+        if len(stage_times) > 0:
+            stage_x = stage_times / 60.0
+            self.sleep_stage_line.set_data(stage_x, stage_values)
+            self.ax_sleep_stage.set_xlim(0, t_max_min)
+            labels = overview_snap["sleep_stage_labels"]
+            stage_pixels = max(1, min(600, int(t_max_min * 2)))
+            rgba = np.zeros((1, stage_pixels, 4), dtype=float)
+            stage_edges = np.linspace(0.0, t_max_min, stage_pixels + 1)
+            labels = list(labels)
+            for pixel in range(stage_pixels):
+                center = 0.5 * (stage_edges[pixel] + stage_edges[pixel + 1])
+                idx = np.searchsorted(stage_x, center, side="right") - 1
+                idx = max(0, min(idx, len(labels) - 1))
+                color = matplotlib.colors.to_rgba(
+                    SLEEP_STAGE_COLORS.get(labels[idx], "#95a5a6"), alpha=1.0)
+                rgba[0, pixel, :] = color
+            self.stage_strip_image.set_data(rgba)
+            self.stage_strip_image.set_extent([0, t_max_min, 0, 1])
+            self.stage_strip.set_xlim(0, t_max_min)
         else:
-            self.pat_amp_line.set_data([], [])
+            self.sleep_stage_line.set_data([], [])
+            self.stage_strip_image.set_data(np.zeros((1, 1, 4)))
+            self.stage_strip_image.set_extent([0, 1, 0, 1])
 
         self._reset_event_lines()
 
-        # PAT events: draw current markers per type
-        pat_events = snap["pat_events"]
+        pat_events = overview_snap["pat_events"]
+        bucket_edges = np.arange(0.0, t_max_min + 5.0, 5.0)
+        if len(bucket_edges) < 2:
+            bucket_edges = np.array([0.0, 5.0])
+        bucket_centers = 0.5 * (bucket_edges[:-1] + bucket_edges[1:])
+        bucket_counts = {
+            evt_type: np.zeros(len(bucket_centers), dtype=float)
+            for evt_type in EVENT_COLORS
+        }
         for ev_time, _, _, _, evt_type in pat_events:
-            color = EVENT_COLORS.get(evt_type, "#95a5a6")
-            vl = self.ax_apnea.axvline(
-                x=ev_time / 60.0, color=color, alpha=0.75, linewidth=1.5)
-            self._evt_lines[evt_type].append(vl)
+            x = ev_time / 60.0
+            bucket_idx = min(
+                len(bucket_centers) - 1,
+                max(0, np.searchsorted(bucket_edges, x, side="right") - 1),
+            )
+            bucket_counts[evt_type][bucket_idx] += 1
             self._drawn_evt_count[evt_type] += 1
 
-        # Central apnea markers (purple)
-        central_events = snap["central_events"]
+        central_events = overview_snap["central_events"]
         for ev_time, _ in central_events:
-            vl = self.ax_apnea.axvline(
-                x=ev_time / 60.0, color=EVENT_COLORS[EVT_CENTRAL],
-                alpha=0.75, linewidth=1.5)
-            self._evt_lines[EVT_CENTRAL].append(vl)
+            x = ev_time / 60.0
+            bucket_idx = min(
+                len(bucket_centers) - 1,
+                max(0, np.searchsorted(bucket_edges, x, side="right") - 1),
+            )
+            bucket_counts[EVT_CENTRAL][bucket_idx] += 1
             self._drawn_evt_count[EVT_CENTRAL] += 1
+        total_heights = np.zeros(len(bucket_centers), dtype=float)
+        for evt_type in (EVT_APNEA, EVT_HYPOPNEA, EVT_RERA, EVT_CENTRAL):
+            total_heights += bucket_counts[evt_type]
+        self._set_bar_container(
+            self.event_bars, bucket_centers, total_heights, np.zeros(len(bucket_centers), dtype=float))
+        max_stack = max(1.0, float(np.max(total_heights)) if len(total_heights) > 0 else 1.0)
+        self.ax_event_burden.set_xlim(0, t_max_min)
+        self.ax_event_burden.set_ylim(0, max(4.0, max_stack * 1.2))
+        playhead_min = overview_playhead_min if overview_playhead_min is not None else t_max_min
+        self.overview_playhead_line.set_xdata([playhead_min, playhead_min])
+        self.stage_playhead_line.set_xdata([playhead_min, playhead_min])
 
         # AHI/RDI text
         pahi = snap["pahi_estimate"]
         rdi  = snap["rdi_estimate"]
         ahi  = snap["ahi_estimate"]
-        n_central = len(central_events)
+        current_central_events = snap["central_events"]
+        n_central = len(current_central_events)
         primary = pahi if pahi >= 0 else ahi
         if primary >= 0:
             n_a = self._drawn_evt_count[EVT_APNEA]
@@ -683,8 +848,12 @@ class WatchPATDashboard:
             self.ax_apnea_ahi_text.set_color("#7f8c8d")
 
         # -- Update stats panel --
-        elapsed = time.time() - snap["start_time"] if snap["start_time"] else 0
-        pkt_rate = (snap["packet_count"] / elapsed) if elapsed > 0 else 0
+        if self.replay_controller is not None:
+            elapsed = float(self.replay_controller.current_index)
+            pkt_rate = self.replay_controller.speed if self.replay_controller.speed > 0 else 0.0
+        else:
+            elapsed = time.time() - snap["start_time"] if snap["start_time"] else 0
+            pkt_rate = (snap["packet_count"] / elapsed) if elapsed > 0 else 0
         kb = snap["total_bytes"] / 1024
         mins = int(elapsed) // 60
         secs = int(elapsed) % 60
@@ -696,7 +865,9 @@ class WatchPATDashboard:
         rdi_val  = snap["rdi_estimate"]
         pahi_str = f"{pahi_val:.1f}" if pahi_val >= 0.0 else "--"
         rdi_str  = f"{rdi_val:.1f}"  if rdi_val  >= 0.0 else "--"
-        n_central_stat = len(snap["central_events"])
+        n_central_stat = len(current_central_events)
+        stage_pct = snap["sleep_stage_percentages"]
+        current_stage = snap["current_sleep_stage"]
         stats_lines = [
             f"Packets:   {snap['packet_count']:>8d}",
             f"Data:      {kb:>7.1f} KB",
@@ -705,6 +876,11 @@ class WatchPATDashboard:
             f"pAHI:      {pahi_str:>5s} /hr",
             f"pRDI:      {rdi_str:>5s} /hr",
             f"Central:   {n_central_stat:>8d}",
+            f"Stage:     {current_stage:>8s}",
+            f"Stages %:  A {stage_pct.get('Awake', 0.0):>4.1f}"
+            f" L {stage_pct.get('Light', 0.0):>4.1f}"
+            f" D {stage_pct.get('Deep', 0.0):>4.1f}"
+            f" R {stage_pct.get('REM', 0.0):>4.1f}",
             f"Metric:    {snap['metric']:>8d}",
             f"Motion:    A={fa} B={fb}",
             f"CRC:       {crc_str:>8s}",
@@ -722,11 +898,13 @@ class WatchPATDashboard:
             self.pos_text, self.pos_label,
             self.stats_text,
             self.spo2_full_line,
-            self.pat_amp_line,
+            self.sleep_stage_line,
             self.ax_apnea_ahi_text,
+            self.overview_playhead_line,
+            self.stage_playhead_line,
         ])
-        for lines in self._evt_lines.values():
-            artists.extend(lines)
+        artists.append(self.stage_strip_image)
+        artists.extend(self.event_bars.patches)
         return artists
 
     def set_mode_label(self, text: str):

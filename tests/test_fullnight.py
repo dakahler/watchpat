@@ -131,6 +131,14 @@ class TestFullNightClinicalMetrics(unittest.TestCase):
         self.assertIsNotNone(s.metric_max)
         self.assertLessEqual(s.metric_min, s.metric_max)
 
+    def test_sleep_stage_percentages_sum_to_approximately_hundred(self):
+        stage_pct = _summary().sleep_stage_percentages
+        self.assertIn("Awake", stage_pct)
+        self.assertIn("Light", stage_pct)
+        self.assertIn("Deep", stage_pct)
+        self.assertIn("REM", stage_pct)
+        self.assertAlmostEqual(sum(stage_pct.values()), 100.0, places=1)
+
 
 class TestFullNightRegressionValues(unittest.TestCase):
     """Pin the exact values produced by the current parser.
