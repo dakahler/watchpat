@@ -22,6 +22,7 @@ The BLE protocol and binary data format were reverse-engineered from the WatchPA
 - **Offline replay** and **CSV export** of all decoded channels
 - **Estimated sleep-event metrics** including ODI-style `AHI`, PAT-based `pAHI`, `pRDI`, and central-event counts during replay/analysis
 - **Capture comparison tool** for diffing two `.dat` files and reporting metric deltas such as `AHI` / `pAHI`
+- **MQTT summary publishing** for final analysis results, with Home Assistant MQTT Discovery support
 
 ## Requirements
 
@@ -44,7 +45,7 @@ If you already have the repo virtualenv, run commands with `.venv/bin/python`.
 Minimal manual install:
 
 ```
-pip install bleak kaitaistruct matplotlib numpy pytest
+pip install bleak kaitaistruct matplotlib numpy pytest paho-mqtt
 ```
 
 ## Usage
@@ -101,6 +102,9 @@ python watchpat_gui.py --replay capture.dat --speed 10  # 10x speed
 # Compare two captures
 python watchpat_diff.py baseline.dat followup.dat
 python watchpat_diff.py baseline.dat followup.dat --json
+
+# Publish a retained MQTT summary from a capture and verify broker round-trip
+python watchpat_mqtt_test.py --input-dat tests/testdata2.dat --server 192.168.1.150 --username watchpat --password watchpat1 --retain
 ```
 
 ### AHI and Related Metrics
@@ -116,11 +120,22 @@ These values appear in the GUI replay dashboard session stats, and `watchpat_dif
 
 The AHI-related values here are heuristic estimates derived from reverse-engineered signal processing in this repo. They are useful for comparing captures and validating pipeline behavior, but they are not a substitute for the vendor software or a clinical scoring workflow.
 
+### MQTT and Home Assistant
+
+The project can publish final analysis summaries over MQTT as a single JSON payload containing values such as `AHI`, `pAHI`, `pRDI`, mean/min `SpO2`, heart-rate stats, and event counts.
+
+- `watchpat_mqtt_test.py` is a Python integration check which analyzes a `.dat` file, publishes the final summary to MQTT, and verifies the broker echoes the retained payload back.
+- By default the test script publishes state to `watchpat/analysis/test` and publishes Home Assistant MQTT Discovery config under the `homeassistant/` prefix.
+- The Android app publishes retained summary state to `watchpat/analysis` and also publishes Home Assistant MQTT Discovery config automatically.
+
+If Home Assistant MQTT Discovery is enabled and connected to the same broker, the published discovery config should create entities automatically for summary metrics like `AHI`, `pAHI`, `pRDI`, mean `SpO2`, and mean heart rate.
+
 ## Tests
 
 ```bash
 python tests/test_protocol.py
 python tests/test_gui.py
+python tests/test_mqtt_payload.py
 ```
 
 The GUI tests are headless and validate dashboard update/close behavior without opening a real desktop window.
@@ -227,9 +242,28 @@ The Gradle wrapper (`android/gradlew`) is included in the repo.
 4. **Wait ~40 seconds** — the device has a firmware warmup period before it begins streaming data packets
 5. Record as long as needed; packet count increments every 10 packets
 6. Tap **Stop Recording**
-7. Tap **Share File** to export the `.dat` file via email, Drive, or any other app
+7. The app runs its Python-based analysis on the finished recording and can publish the final summary to MQTT
+8. Tap **Share File** to export the `.dat` file via email, Drive, or any other app
 
 Recordings are saved to app-specific external storage and are not accessible via the phone's file manager — use the Share button or USB transfer.
+
+### MQTT summary publishing
+
+The Android app includes an **MQTT Config** screen where you can set:
+
+- MQTT server URI or host
+- Optional MQTT username
+- Optional MQTT password
+
+When a recording analysis completes, the app publishes one retained JSON summary to:
+
+- `watchpat/analysis`
+
+It also publishes retained Home Assistant MQTT Discovery config topics under:
+
+- `homeassistant/sensor/watchpat_android_summary/.../config`
+
+This allows Home Assistant to create MQTT entities automatically if MQTT Discovery is enabled.
 
 ### Protocol notes
 
@@ -246,6 +280,7 @@ The Android app implements the same NUS protocol as the Python client. Key imple
 | `watchpat_ble.py` | BLE client, protocol implementation, data decoding, CLI |
 | `watchpat_gui.py` | Real-time matplotlib dashboard |
 | `watchpat_diff.py` | Offline comparator for two `.dat` captures, including AHI/pAHI/pRDI deltas |
+| `watchpat_mqtt_test.py` | MQTT integration verifier for retained analysis summary publishing |
 | `watchpat_to_resmed_sd.py` | Export tool for ResMed SD card format |
 | `build_apk.py` | Build the Android debug APK |
 | `install_apk.py` | Install the APK via USB (adb) |
