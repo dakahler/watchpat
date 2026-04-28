@@ -71,6 +71,37 @@ class TestWatchPATDashboard(unittest.TestCase):
 
         watchpat_gui._apply_window_icon(fig)
 
+    def test_apply_window_icon_uses_ico_for_windows_window_and_default(self):
+        window = mock.Mock()
+        fig = mock.Mock()
+        fig.canvas = mock.Mock(manager=mock.Mock(window=window))
+
+        with mock.patch.object(watchpat_gui.sys, "platform", "win32"):
+            with mock.patch.object(watchpat_gui.Path, "exists", return_value=True):
+                watchpat_gui._apply_window_icon(fig)
+
+        self.assertEqual(
+            window.iconbitmap.call_args_list,
+            [
+                mock.call(str(watchpat_gui.APP_ICON_ICO)),
+                mock.call(default=str(watchpat_gui.APP_ICON_ICO)),
+            ],
+        )
+        window.iconphoto.assert_not_called()
+        fig.canvas.draw_idle.assert_called_once_with()
+
+    def test_configure_windows_taskbar_icon_sets_app_id(self):
+        shell32 = mock.Mock()
+        fake_ctypes = mock.Mock(windll=mock.Mock(shell32=shell32))
+
+        with mock.patch.object(watchpat_gui.sys, "platform", "win32"):
+            with mock.patch.dict(sys.modules, {"ctypes": fake_ctypes}):
+                watchpat_gui._configure_windows_taskbar_icon()
+
+        shell32.SetCurrentProcessExplicitAppUserModelID.assert_called_once_with(
+            watchpat_gui.WINDOWS_APP_ID
+        )
+
     def test_update_populates_dashboard_text_and_lines(self):
         artists = self.dashboard.update(frame=0)
 

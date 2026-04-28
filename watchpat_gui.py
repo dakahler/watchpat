@@ -101,6 +101,7 @@ REPLAY_CACHE_VERSION = 2
 APP_ICON_DIR = Path(__file__).resolve().parent / "assets" / "icons"
 APP_ICON_PNG = APP_ICON_DIR / "watchpat_app_icon.png"
 APP_ICON_ICO = APP_ICON_DIR / "watchpat_app_icon.ico"
+WINDOWS_APP_ID = "WatchPAT.ONE.Dashboard"
 
 CHANNEL_COLORS = {
     "OxiA":  "#e74c3c",
@@ -163,12 +164,14 @@ def _apply_window_icon(fig):
     if window is None:
         return
     try:
+        icon_set = False
         if sys.platform.startswith("win") and APP_ICON_ICO.exists():
             iconbitmap = getattr(window, "iconbitmap", None)
             if callable(iconbitmap):
+                iconbitmap(str(APP_ICON_ICO))
                 iconbitmap(default=str(APP_ICON_ICO))
-                return
-        if APP_ICON_PNG.exists():
+                icon_set = True
+        elif APP_ICON_PNG.exists():
             import tkinter as tk
 
             iconphoto = getattr(window, "iconphoto", None)
@@ -177,8 +180,26 @@ def _apply_window_icon(fig):
                 # Keep a reference alive for Tk.
                 setattr(window, "_watchpat_icon_image", image)
                 iconphoto(True, image)
+                icon_set = True
+        if icon_set:
+            fig.canvas.draw_idle()
     except Exception:
         logger.debug("Unable to apply desktop window icon.", exc_info=True)
+
+
+def _configure_windows_taskbar_icon():
+    """Give Windows a stable app identity before the GUI window is created."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            WINDOWS_APP_ID
+        )
+    except Exception:
+        logger.debug("Unable to configure Windows taskbar icon.", exc_info=True)
+
 
 def _normalize_replay_payload(raw: bytes) -> bytes:
     """Accept either a payload-only capture record or a full BLE packet."""
@@ -451,6 +472,7 @@ class WatchPATDashboard:
         pause_right.set_visible(not paused)
 
     def _build_figure(self):
+        _configure_windows_taskbar_icon()
         self.fig = plt.figure(
             figsize=(16, 9),
             facecolor="#1a1a2e",
