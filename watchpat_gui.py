@@ -22,18 +22,37 @@ import struct
 import sys
 import threading
 import time
+import tempfile
 from collections import deque
 from hashlib import sha1
+from pathlib import Path
 from queue import Queue, Empty
 from typing import Optional
 
 import matplotlib
 
 
+def _running_unittest() -> bool:
+    argv = sys.argv
+    return (
+        len(argv) >= 3
+        and argv[1] == "-m"
+        and argv[2] == "unittest"
+    )
+
+
 def _configure_matplotlib_backend():
-    """Prefer a native interactive backend and avoid forcing Tk on macOS."""
+    """Prefer an interactive backend that can also accept a custom app icon."""
     backend_logger = logging.getLogger("watchpat.gui")
     if os.environ.get("MPLBACKEND"):
+        return
+    if _running_unittest():
+        os.environ.setdefault(
+            "MPLCONFIGDIR",
+            os.path.join(tempfile.gettempdir(), "watchpat-mpl"),
+        )
+        matplotlib.use("Agg")
+        backend_logger.info("Using matplotlib backend: Agg (unittest)")
         return
     preferred = ["MacOSX", "TkAgg"] if sys.platform == "darwin" else ["TkAgg"]
     for backend in preferred:
@@ -50,9 +69,9 @@ def _configure_matplotlib_backend():
 _configure_matplotlib_backend()
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.patches import FancyBboxPatch, Circle
-from matplotlib.gridspec import GridSpec
-from matplotlib.widgets import Button, Slider
+from matplotlib.patches import FancyBboxPatch, Circle, Polygon, Rectangle
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+from matplotlib.widgets import Button
 import numpy as np
 
 from watchpat_ble import (
@@ -75,6 +94,13 @@ from watchpat_analysis import (
 
 FPS = 15
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+WAVEFORM_Y_SHRINK_ALPHA = 0.05
+WAVEFORM_Y_ENVELOPE_PACKETS = 6
+WAVEFORM_Y_UPDATE_EVERY_PACKETS = 3
+REPLAY_CACHE_VERSION = 2
+APP_ICON_DIR = Path(__file__).resolve().parent / "assets" / "icons"
+APP_ICON_PNG = APP_ICON_DIR / "watchpat_app_icon.png"
+APP_ICON_ICO = APP_ICON_DIR / "watchpat_app_icon.ico"
 
 CHANNEL_COLORS = {
     "OxiA":  "#e74c3c",
@@ -97,6 +123,7 @@ SLEEP_STAGE_COLORS = {
     SLEEP_STAGE_DEEP: "#2ee6a6",
     SLEEP_STAGE_REM: "#ff73c6",
 }
+SLEEP_STAGE_BG_RGBA = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
 
 
 def _smooth_and_downsample(x, y, window: int = 9, max_points: int = 600):
@@ -111,12 +138,47 @@ def _smooth_and_downsample(x, y, window: int = 9, max_points: int = 600):
         return np.array([]), np.array([])
     if window > 1 and len(y_arr) >= window:
         kernel = np.ones(window, dtype=float) / float(window)
-        y_arr = np.convolve(y_arr, kernel, mode="same")
+        pad_l = (window - 1) // 2
+        pad_r = window - 1 - pad_l
+        padded = np.pad(y_arr, (pad_l, pad_r), mode="edge")
+        y_arr = np.convolve(padded, kernel, mode="valid")
     if len(x_arr) > max_points:
         step = int(math.ceil(len(x_arr) / float(max_points)))
         x_arr = x_arr[::step]
         y_arr = y_arr[::step]
     return x_arr, y_arr
+
+
+def _valid_spo2_xy(x, y):
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    valid = np.isfinite(y_arr) & (y_arr > 0)
+    return x_arr[valid], y_arr[valid]
+
+
+def _apply_window_icon(fig):
+    """Best-effort desktop icon for Tk-backed windows."""
+    manager = getattr(fig.canvas, "manager", None)
+    window = getattr(manager, "window", None)
+    if window is None:
+        return
+    try:
+        if sys.platform.startswith("win") and APP_ICON_ICO.exists():
+            iconbitmap = getattr(window, "iconbitmap", None)
+            if callable(iconbitmap):
+                iconbitmap(default=str(APP_ICON_ICO))
+                return
+        if APP_ICON_PNG.exists():
+            import tkinter as tk
+
+            iconphoto = getattr(window, "iconphoto", None)
+            if callable(iconphoto):
+                image = tk.PhotoImage(file=str(APP_ICON_PNG))
+                # Keep a reference alive for Tk.
+                setattr(window, "_watchpat_icon_image", image)
+                iconphoto(True, image)
+    except Exception:
+        logger.debug("Unable to apply desktop window icon.", exc_info=True)
 
 def _normalize_replay_payload(raw: bytes) -> bytes:
     """Accept either a payload-only capture record or a full BLE packet."""
@@ -141,6 +203,15 @@ def _decode_packets_for_replay(path: str) -> list[ParsedDataPacket]:
             for idx, raw in enumerate(raw_packets)
         ]
 
+    # Replay loading runs in a background thread so the GUI stays responsive.
+    # On macOS, spawning a process pool from that worker thread has proven
+    # unreliable; prefer the straightforward in-process decode in that case.
+    if threading.current_thread() is not threading.main_thread():
+        return [
+            parse_data_packet(_normalize_replay_payload(raw), idx)
+            for idx, raw in enumerate(raw_packets)
+        ]
+
     workers = min(8, max(2, os.cpu_count() or 2))
     chunk_size = max(256, int(math.ceil(len(raw_packets) / float(workers * 4))))
     chunks = [
@@ -148,9 +219,19 @@ def _decode_packets_for_replay(path: str) -> list[ParsedDataPacket]:
         for start_idx in range(0, len(raw_packets), chunk_size)
     ]
     packets: list[ParsedDataPacket] = []
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        for decoded in executor.map(_decode_packet_chunk, chunks):
-            packets.extend(decoded)
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            for decoded in executor.map(_decode_packet_chunk, chunks):
+                packets.extend(decoded)
+    except Exception:
+        logger.warning(
+            "Replay multiprocessing unavailable; falling back to serial decode.",
+            exc_info=True,
+        )
+        return [
+            parse_data_packet(_normalize_replay_payload(raw), idx)
+            for idx, raw in enumerate(raw_packets)
+        ]
     return packets
 
 
@@ -167,9 +248,9 @@ class ReplayController:
         self._paused = speed <= 0
         self.packets: list[ParsedDataPacket] = []
         self.checkpoints: dict[int, SensorBuffers] = {0: SensorBuffers()}
-        self.full_buffers = SensorBuffers()
+        self.full_buffers = SensorBuffers(full_session_history=True)
         if not self._load_cache():
-            checkpoint_builder = SensorBuffers()
+            checkpoint_builder = SensorBuffers(full_session_history=True)
             packet_source = (
                 _decode_packets_for_replay(path)
                 if os.path.exists(path)
@@ -210,6 +291,8 @@ class ReplayController:
         try:
             with open(cache_path, "rb") as fh:
                 payload = pickle.load(fh)
+            if payload.get("cache_version") != REPLAY_CACHE_VERSION:
+                return False
             self.packets = payload["packets"]
             self.checkpoints = {
                 idx: SensorBuffers.from_serialized_state(state)
@@ -227,6 +310,7 @@ class ReplayController:
         cache_path = self._cache_path()
         try:
             payload = {
+                "cache_version": REPLAY_CACHE_VERSION,
                 "packets": self.packets,
                 "checkpoints": {
                     idx: buf.serialize_state()
@@ -289,6 +373,12 @@ class WatchPATDashboard:
         self.buffers = buffers
         self.anim = None
         self._closing = False
+        self._wave_y_limits: dict[str, tuple[float, float]] = {}
+        self._wave_y_history: dict[str, deque[tuple[float, float]]] = {}
+        self._wave_y_last_packet: dict[str, int] = {}
+        self._wave_y_last_update_packet: dict[str, int] = {}
+        self._replay_button_icon_artists: list = []
+        self._replay_button_is_paused = False
         self.replay_controller: Optional[ReplayController] = None
         self._pending_replay_queue: Optional[Queue] = None
         self._pending_replay_label = ""
@@ -299,62 +389,126 @@ class WatchPATDashboard:
         self._loading_tick = 0
         self._build_figure()
 
+    def _target_wave_ylim(self, data: np.ndarray) -> tuple[float, float]:
+        lo = float(np.min(data))
+        hi = float(np.max(data))
+        margin = max((hi - lo) * 0.1, 1.0)
+        return lo - margin, hi + margin
+
+    def _wave_ylim_for(self, name: str, data: np.ndarray, packet_count: int) -> tuple[float, float]:
+        target_lo, target_hi = self._target_wave_ylim(data)
+        history = self._wave_y_history.setdefault(
+            name, deque(maxlen=WAVEFORM_Y_ENVELOPE_PACKETS)
+        )
+        if self._wave_y_last_packet.get(name) != packet_count:
+            history.append((target_lo, target_hi))
+            self._wave_y_last_packet[name] = packet_count
+        if history:
+            env_lo = min(lo for lo, _ in history)
+            env_hi = max(hi for _, hi in history)
+        else:
+            env_lo, env_hi = target_lo, target_hi
+
+        current = self._wave_y_limits.get(name)
+        if current is None:
+            self._wave_y_limits[name] = (env_lo, env_hi)
+            self._wave_y_last_update_packet[name] = packet_count
+            return env_lo, env_hi
+
+        cur_lo, cur_hi = current
+
+        # Expand immediately when the recent packet envelope exceeds the current
+        # display range so we never clip real motion.
+        cur_lo = min(cur_lo, env_lo)
+        cur_hi = max(cur_hi, env_hi)
+
+        last_update_packet = self._wave_y_last_update_packet.get(name, packet_count)
+        enough_new_packets = (
+            packet_count - last_update_packet >= WAVEFORM_Y_UPDATE_EVERY_PACKETS
+        )
+        if len(data) >= BUFFER_SIZE and enough_new_packets:
+            cur_lo += (env_lo - cur_lo) * WAVEFORM_Y_SHRINK_ALPHA
+            cur_hi += (env_hi - cur_hi) * WAVEFORM_Y_SHRINK_ALPHA
+            self._wave_y_last_update_packet[name] = packet_count
+
+        self._wave_y_limits[name] = (cur_lo, cur_hi)
+        return cur_lo, cur_hi
+
+    def _reset_wave_y_scaling(self):
+        """Drop cached waveform y-scale state after a discontinuous jump."""
+        self._wave_y_limits.clear()
+        self._wave_y_history.clear()
+        self._wave_y_last_packet.clear()
+        self._wave_y_last_update_packet.clear()
+
+    def _set_replay_button_icon(self, paused: bool):
+        self._replay_button_is_paused = paused
+        if len(self._replay_button_icon_artists) != 3:
+            return
+        play_icon, pause_left, pause_right = self._replay_button_icon_artists
+        play_icon.set_visible(paused)
+        pause_left.set_visible(not paused)
+        pause_right.set_visible(not paused)
+
     def _build_figure(self):
         self.fig = plt.figure(
-            figsize=(16, 13),
+            figsize=(16, 9),
             facecolor="#1a1a2e",
         )
         self.fig.canvas.manager.set_window_title("WatchPAT ONE Dashboard")
+        _apply_window_icon(self.fig)
 
-        # Layout: 7 rows x 5 cols
-        # Left (cols 0-2, rows 0-5): OxiA, OxiB, PAT, Chest, Heart Rate, SpO2
-        # Right (cols 3-4, rows 0-5): HR readout, SpO2 readout, Body Pos, Accel, Session
-        # Full width (row 6): Apnea Events Timeline
+        # Left 30% = compact waveform strips (cols 0-2)
+        # Right 70% = readout bar (rows 0-1) + dominant sleep overview (rows 2-7)
+        # Row 7 has height ratio 4 so the sleep overview gets ~75% of vertical space
         gs = GridSpec(
-            7, 5, figure=self.fig,
-            left=0.06, right=0.98, top=0.94, bottom=0.04,
-            hspace=0.45, wspace=0.4,
+            8, 10, figure=self.fig,
+            left=0.05, right=0.98, top=0.94, bottom=0.04,
+            hspace=0.6, wspace=0.4,
+            height_ratios=[1, 1, 1, 1, 1, 1, 1, 4],
         )
+        LEFT = slice(None, 3)
+        RIGHT = slice(3, None)
 
         dark_bg = "#16213e"
         grid_color = "#2a2a4a"
         text_color = "#e0e0e0"
 
-        # -- Waveform axes (left, rows 0-3) --
+        # -- Left strip: compact waveform plots (rows 0-3) --
         self.wave_axes = {}
         self.wave_lines = {}
         channels = [
-            ("OxiA", "Oximetry A (Red/IR)", 0),
-            ("OxiB", "Oximetry B (Red/IR)", 1),
-            ("PAT",  "PAT Signal", 2),
-            ("Chest", "Chest / Resp. Effort", 3),
+            ("OxiA",  "Oximetry A",  0),
+            ("OxiB",  "Oximetry B",  1),
+            ("PAT",   "PAT Signal",  2),
+            ("Chest", "Chest/Resp",  3),
         ]
         for name, title, row in channels:
-            ax = self.fig.add_subplot(gs[row, :3])
+            ax = self.fig.add_subplot(gs[row, LEFT])
             ax.set_facecolor(dark_bg)
-            ax.set_title(title, color=text_color, fontsize=9,
-                         fontweight="bold", loc="left", pad=4)
-            ax.tick_params(colors=text_color, labelsize=7)
+            ax.set_title(title, color=text_color, fontsize=7,
+                         fontweight="bold", loc="left", pad=2)
+            ax.tick_params(colors=text_color, labelsize=6)
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             for spine in ax.spines.values():
                 spine.set_color(grid_color)
             ax.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
             ax.set_xlim(0, BUFFER_SIZE)
-            ax.set_ylabel("", fontsize=7, color=text_color)
             ax.set_xticklabels([])
+            ax.set_yticklabels([])
             line, = ax.plot([], [], color=CHANNEL_COLORS[name],
                             linewidth=0.8, antialiased=True)
             self.wave_axes[name] = ax
             self.wave_lines[name] = line
 
-        # -- Heart Rate trend (row 4 left) --
-        self.ax_hr_trend = self.fig.add_subplot(gs[4, :3])
+        # -- HR trend (row 4, left) --
+        self.ax_hr_trend = self.fig.add_subplot(gs[4, LEFT])
         self.ax_hr_trend.set_facecolor(dark_bg)
         self.ax_hr_trend.set_title("Heart Rate (BPM)", color=text_color,
-                                    fontsize=9, fontweight="bold",
-                                    loc="left", pad=4)
-        self.ax_hr_trend.tick_params(colors=text_color, labelsize=7)
+                                    fontsize=7, fontweight="bold",
+                                    loc="left", pad=2)
+        self.ax_hr_trend.tick_params(colors=text_color, labelsize=6)
         self.ax_hr_trend.spines["top"].set_visible(False)
         self.ax_hr_trend.spines["right"].set_visible(False)
         for spine in self.ax_hr_trend.spines.values():
@@ -363,16 +517,17 @@ class WatchPATDashboard:
         self.ax_hr_trend.set_xlim(0, DERIVED_HISTORY)
         self.ax_hr_trend.set_ylim(40, 120)
         self.ax_hr_trend.set_xticklabels([])
+        self.ax_hr_trend.set_yticklabels([])
         self.hr_trend_line, = self.ax_hr_trend.plot(
-            [], [], color="#e74c3c", linewidth=1.5)
+            [], [], color="#e74c3c", linewidth=1.2)
 
-        # -- SpO2 trend (row 5 left) --
-        self.ax_spo2_trend = self.fig.add_subplot(gs[5, :3])
+        # -- SpO2 trend (row 5, left) --
+        self.ax_spo2_trend = self.fig.add_subplot(gs[5, LEFT])
         self.ax_spo2_trend.set_facecolor(dark_bg)
-        self.ax_spo2_trend.set_title("SpO2 (%)", color=text_color,
-                                      fontsize=9, fontweight="bold",
-                                      loc="left", pad=4)
-        self.ax_spo2_trend.tick_params(colors=text_color, labelsize=7)
+        self.ax_spo2_trend.set_title("SpO₂ (%)", color=text_color,
+                                      fontsize=7, fontweight="bold",
+                                      loc="left", pad=2)
+        self.ax_spo2_trend.tick_params(colors=text_color, labelsize=6)
         self.ax_spo2_trend.spines["top"].set_visible(False)
         self.ax_spo2_trend.spines["right"].set_visible(False)
         for spine in self.ax_spo2_trend.spines.values():
@@ -380,15 +535,52 @@ class WatchPATDashboard:
         self.ax_spo2_trend.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
         self.ax_spo2_trend.set_xlim(0, DERIVED_HISTORY)
         self.ax_spo2_trend.set_ylim(85, 100)
-        self.ax_spo2_trend.set_xlabel("Seconds ago", fontsize=7,
-                                       color=text_color)
+        self.ax_spo2_trend.set_xticklabels([])
+        self.ax_spo2_trend.set_yticklabels([])
         self.spo2_trend_line, = self.ax_spo2_trend.plot(
-            [], [], color="#3498db", linewidth=1.5)
+            [], [], color="#3498db", linewidth=1.2)
 
-        # -- Right panel --
+        # -- Accelerometer (row 6, left) --
+        self.ax_accel = self.fig.add_subplot(gs[6, LEFT])
+        self.ax_accel.set_facecolor(dark_bg)
+        self.ax_accel.set_title("Accelerometer", color=text_color,
+                                fontsize=7, fontweight="bold",
+                                loc="left", pad=2)
+        self.ax_accel.tick_params(colors=text_color, labelsize=6)
+        for spine in self.ax_accel.spines.values():
+            spine.set_color(grid_color)
+        self.ax_accel.spines["top"].set_visible(False)
+        self.ax_accel.spines["right"].set_visible(False)
+        self.ax_accel.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
+        self.ax_accel.set_xlim(0, MOTION_BUFFER)
+        self.ax_accel.set_xticklabels([])
+        self.ax_accel.set_yticklabels([])
+        self.accel_lines = {
+            "x": self.ax_accel.plot([], [], color="#e74c3c", linewidth=0.8,
+                                     label="X")[0],
+            "y": self.ax_accel.plot([], [], color="#2ecc71", linewidth=0.8,
+                                     label="Y")[0],
+            "z": self.ax_accel.plot([], [], color="#3498db", linewidth=0.8,
+                                     label="Z")[0],
+        }
 
-        # Heart Rate readout (row 0 right)
-        self.ax_hr = self.fig.add_subplot(gs[0, 3:])
+        # -- Session stats (row 7, left) --
+        self.ax_stats = self.fig.add_subplot(gs[7, LEFT])
+        self.ax_stats.set_facecolor(dark_bg)
+        self.ax_stats.set_xlim(0, 1)
+        self.ax_stats.set_ylim(0, 1)
+        self.ax_stats.axis("off")
+        self.ax_stats.set_title("Session", color=text_color,
+                                fontsize=8, fontweight="bold", pad=4)
+        self.stats_text = self.ax_stats.text(
+            0.05, 0.95, "", fontsize=8, color=text_color,
+            fontfamily="monospace", verticalalignment="top",
+            transform=self.ax_stats.transAxes)
+
+        # -- Right panel: readout bar (rows 0-1) --
+
+        # Heart Rate readout (cols 3-5)
+        self.ax_hr = self.fig.add_subplot(gs[0:2, 3:6])
         self.ax_hr.set_facecolor(dark_bg)
         self.ax_hr.set_xlim(0, 1)
         self.ax_hr.set_ylim(0, 1)
@@ -404,8 +596,8 @@ class WatchPATDashboard:
             fontsize=11, color=text_color,
             transform=self.ax_hr.transAxes)
 
-        # SpO2 readout (row 1 right)
-        self.ax_spo2 = self.fig.add_subplot(gs[1, 3:])
+        # SpO2 readout (cols 6-7)
+        self.ax_spo2 = self.fig.add_subplot(gs[0:2, 6:8])
         self.ax_spo2.set_facecolor(dark_bg)
         self.ax_spo2.set_xlim(0, 1)
         self.ax_spo2.set_ylim(0, 1)
@@ -421,8 +613,8 @@ class WatchPATDashboard:
             fontsize=11, color=text_color,
             transform=self.ax_spo2.transAxes)
 
-        # Body position (row 2 right)
-        self.ax_pos = self.fig.add_subplot(gs[2, 3:])
+        # Body position (cols 8-9)
+        self.ax_pos = self.fig.add_subplot(gs[0:2, 8:10])
         self.ax_pos.set_facecolor(dark_bg)
         self.ax_pos.set_xlim(0, 1)
         self.ax_pos.set_ylim(0, 1)
@@ -438,44 +630,6 @@ class WatchPATDashboard:
             fontsize=11, color=text_color,
             transform=self.ax_pos.transAxes)
 
-        # Accelerometer (row 3 right)
-        self.ax_accel = self.fig.add_subplot(gs[3, 3:])
-        self.ax_accel.set_facecolor(dark_bg)
-        self.ax_accel.set_title("Accelerometer", color=text_color,
-                                fontsize=9, fontweight="bold",
-                                loc="left", pad=4)
-        self.ax_accel.tick_params(colors=text_color, labelsize=7)
-        for spine in self.ax_accel.spines.values():
-            spine.set_color(grid_color)
-        self.ax_accel.spines["top"].set_visible(False)
-        self.ax_accel.spines["right"].set_visible(False)
-        self.ax_accel.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
-        self.ax_accel.set_xlim(0, MOTION_BUFFER)
-        self.accel_lines = {
-            "x": self.ax_accel.plot([], [], color="#e74c3c", linewidth=1,
-                                     label="X")[0],
-            "y": self.ax_accel.plot([], [], color="#2ecc71", linewidth=1,
-                                     label="Y")[0],
-            "z": self.ax_accel.plot([], [], color="#3498db", linewidth=1,
-                                     label="Z")[0],
-        }
-        self.ax_accel.legend(fontsize=7, loc="upper right",
-                             facecolor=dark_bg, edgecolor=grid_color,
-                             labelcolor=text_color)
-
-        # Session stats (rows 4-5 right)
-        self.ax_stats = self.fig.add_subplot(gs[4:6, 3:])
-        self.ax_stats.set_facecolor(dark_bg)
-        self.ax_stats.set_xlim(0, 1)
-        self.ax_stats.set_ylim(0, 1)
-        self.ax_stats.axis("off")
-        self.ax_stats.set_title("Session", color=text_color,
-                                fontsize=9, fontweight="bold", pad=4)
-        self.stats_text = self.ax_stats.text(
-            0.05, 0.90, "", fontsize=9, color=text_color,
-            fontfamily="monospace", verticalalignment="top",
-            transform=self.ax_stats.transAxes)
-
         # Title bar
         self.title_text = self.fig.text(
             0.5, 0.97, "WatchPAT ONE — Sensor Dashboard",
@@ -487,8 +641,13 @@ class WatchPATDashboard:
             color="#95a5a6",
         )
 
-        # -- Sleep overview timeline (row 6, full width) --
-        self.ax_apnea = self.fig.add_subplot(gs[6, :])
+        # -- Sleep overview timeline (rows 2-7, full right width) --
+        # Split the right panel: main overview on top, stage colour strip below (no gap)
+        _right_inner = GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=gs[2:, RIGHT],
+            height_ratios=[12, 1], hspace=0,
+        )
+        self.ax_apnea = self.fig.add_subplot(_right_inner[0])
         self.ax_apnea.set_facecolor(dark_bg)
         self.ax_apnea.tick_params(colors=text_color, labelsize=7)
         self.ax_apnea.spines["top"].set_visible(False)
@@ -496,7 +655,7 @@ class WatchPATDashboard:
             spine.set_color(grid_color)
         self.ax_apnea.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
         self.ax_apnea.set_ylim(80, 102)
-        self.ax_apnea.set_xlabel("Elapsed (min)", fontsize=7, color=text_color)
+        self.ax_apnea.set_xticklabels([])
         self.ax_apnea.set_ylabel("SpO₂ (%)", fontsize=7, color="#3498db")
         self.ax_apnea.tick_params(axis="y", colors="#3498db")
         self.ax_apnea.set_title(
@@ -562,18 +721,19 @@ class WatchPATDashboard:
         self.sleep_stage_line, = self.ax_sleep_stage.step(
             [], [], where="post", color="#ffffff", linewidth=2.4, alpha=0.95)
         self.sleep_stage_line.set_alpha(0.0)
-        self.stage_strip = self.ax_apnea.inset_axes([0.0, 0.00, 1.0, 0.14], sharex=self.ax_apnea)
+        self.stage_strip = self.fig.add_subplot(_right_inner[1], sharex=self.ax_apnea)
         self.stage_strip.set_facecolor("#111827")
         self.stage_strip.set_ylim(0, 1)
         self.stage_strip.set_yticks([])
         self.stage_strip.set_ylabel("Stage", fontsize=7, color="#ecf0f1", labelpad=8)
+        self.stage_strip.set_xlabel("Elapsed (min)", fontsize=7, color=text_color)
         self.stage_strip.tick_params(axis="x", colors=text_color, labelsize=7)
         self.stage_strip.spines["top"].set_color("#34495e")
         self.stage_strip.spines["right"].set_visible(False)
         self.stage_strip.spines["left"].set_color(grid_color)
         self.stage_strip.spines["bottom"].set_color(grid_color)
         self.stage_strip_image = self.stage_strip.imshow(
-            np.zeros((1, 1, 4)),
+            SLEEP_STAGE_BG_RGBA.reshape(1, 1, 4),
             extent=[0, 1, 0, 1],
             aspect="auto",
             origin="lower",
@@ -621,67 +781,96 @@ class WatchPATDashboard:
         """Attach replay controls for seeking through preloaded data."""
         self.replay_controller = controller
         self.buffers = controller.buffers
-        self.fig.subplots_adjust(bottom=0.24)
-
-        apnea_pos = self.ax_apnea.get_position()
-        lifted_pos = [
-            apnea_pos.x0,
-            apnea_pos.y0 + 0.055,
-            apnea_pos.width,
-            apnea_pos.height - 0.010,
-        ]
-        self.ax_apnea.set_position(lifted_pos)
-        self.ax_event_burden.set_position(lifted_pos)
-        self.ax_sleep_stage.set_position(lifted_pos)
-
-        dark_bg = "#16213e"
         text_color = "#e0e0e0"
-        slider_ax = self.fig.add_axes([0.12, 0.010, 0.64, 0.024], facecolor=dark_bg)
-        button_ax = self.fig.add_axes([0.80, 0.004, 0.10, 0.042])
-        status_ax = self.fig.add_axes([0.91, 0.000, 0.08, 0.050], facecolor="none")
-        status_ax.axis("off")
 
-        max_packet = max(controller.packet_count, 1)
-        self.replay_slider = Slider(
-            slider_ax,
-            "Replay",
-            0,
-            max_packet,
-            valinit=controller.current_index,
-            valstep=1,
-            color="#3498db",
-            dragging=False,
+        # Pause button floats inside the sleep overview — no margin adjustment needed
+        _btn_ax = self.ax_apnea.inset_axes([0.928, 0.905, 0.065, 0.095])
+        _btn_ax.set_facecolor("none")
+        _btn_ax.set_aspect("equal", adjustable="box")
+        _btn_ax.set_xticks([])
+        _btn_ax.set_yticks([])
+        for spine in _btn_ax.spines.values():
+            spine.set_visible(False)
+        _btn_ax.add_patch(
+            Circle(
+                (0.5, 0.5),
+                0.48,
+                transform=_btn_ax.transAxes,
+                facecolor="#2a2a4a",
+                edgecolor="#4a4a8a",
+                linewidth=1.2,
+            )
         )
-        self.replay_slider.label.set_color(text_color)
-        self.replay_slider.valtext.set_color(text_color)
+        play_icon = Polygon(
+            [(0.42, 0.32), (0.42, 0.68), (0.70, 0.50)],
+            closed=True,
+            transform=_btn_ax.transAxes,
+            facecolor=text_color,
+            edgecolor="none",
+        )
+        pause_left = Rectangle(
+            (0.37, 0.30),
+            0.10,
+            0.40,
+            transform=_btn_ax.transAxes,
+            facecolor=text_color,
+            edgecolor="none",
+        )
+        pause_right = Rectangle(
+            (0.53, 0.30),
+            0.10,
+            0.40,
+            transform=_btn_ax.transAxes,
+            facecolor=text_color,
+            edgecolor="none",
+        )
+        _btn_ax.add_patch(play_icon)
+        _btn_ax.add_patch(pause_left)
+        _btn_ax.add_patch(pause_right)
+        self._replay_button_icon_artists = [play_icon, pause_left, pause_right]
         self.replay_button = Button(
-            button_ax,
-            "Pause" if not controller.paused else "Play",
-            color="#2a2a4a",
-            hovercolor="#3a3a5a",
+            _btn_ax,
+            "",
+            color="none",
+            hovercolor="none",
         )
-        self.replay_status_text = status_ax.text(
-            0.5, 0.5, "",
-            ha="center", va="center", fontsize=9, color=text_color,
-            transform=status_ax.transAxes,
+        self.replay_button.label.set_visible(False)
+        _btn_ax.patch.set_alpha(0.0)
+        self._set_replay_button_icon(controller.paused)
+
+        # Status text floats near the bottom of the sleep overview
+        self.replay_status_text = self.ax_apnea.text(
+            0.01, 0.03, "",
+            ha="left", va="bottom", fontsize=8, color=text_color,
+            transform=self.ax_apnea.transAxes, zorder=10,
         )
 
-        def _on_slider_change(val):
-            if self._ignore_slider_change:
-                return
-            controller.seek(int(val))
-            self.buffers = controller.buffers
-            if self.fig.canvas:
-                self.fig.canvas.draw_idle()
-
-        def _on_button(_event):
+        def _on_button(_):
             paused = controller.toggle_paused()
-            self.replay_button.label.set_text("Play" if paused else "Pause")
+            self._set_replay_button_icon(paused)
             if self.fig.canvas:
                 self.fig.canvas.draw_idle()
 
-        self.replay_slider.on_changed(_on_slider_change)
+        # twinx axes overlay ax_apnea and capture clicks in the main graph area
+        _seekable = frozenset({
+            self.ax_apnea, self.stage_strip,
+            self.ax_event_burden, self.ax_sleep_stage,
+        })
+
+        def _on_graph_click(event):
+            if event.inaxes not in _seekable:
+                return
+            if event.xdata is None:
+                return
+            target_idx = int(float(event.xdata) * 60.0)
+            controller.seek(target_idx)
+            self.buffers = controller.buffers
+            self._reset_wave_y_scaling()
+            if self.fig.canvas:
+                self.fig.canvas.draw_idle()
+
         self.replay_button.on_clicked(_on_button)
+        self.fig.canvas.mpl_connect("button_press_event", _on_graph_click)
         self._sync_replay_controls()
 
     def _sync_replay_controls(self):
@@ -693,7 +882,7 @@ class WatchPATDashboard:
             self.replay_slider.set_val(ctrl.current_index)
             self._ignore_slider_change = False
         if self.replay_button is not None:
-            self.replay_button.label.set_text("Play" if ctrl.paused else "Pause")
+            self._set_replay_button_icon(ctrl.paused)
         if self.replay_status_text is not None:
             total = max(ctrl.packet_count, 1)
             cur_min = ctrl.current_index / 60.0
@@ -744,7 +933,7 @@ class WatchPATDashboard:
             else:
                 self._loading_tick += 1
                 s = _SPINNER[(self._loading_tick // 3) % len(_SPINNER)]
-                self._loading_text.set_text(f"  {s}  Analysing recording…  ")
+                self._loading_text.set_text(f"  {s}  Analyzing recording…  ")
                 self._loading_text.set_visible(True)
 
         if self.replay_controller is not None:
@@ -762,21 +951,47 @@ class WatchPATDashboard:
             if isinstance(full_buffers, SensorBuffers):
                 overview_snap = full_buffers.snapshot()
             overview_total_min = self.replay_controller.packet_count / 60.0
-            overview_playhead_min = self.replay_controller.current_index / 60.0
+            # Use the float _playhead so the position indicator moves every frame
+            overview_playhead_min = self.replay_controller._playhead / 60.0
+
+        # Pre-fetch leading samples from the next unprocessed packet so waveforms
+        # scroll smoothly between packet boundaries (replay only).
+        _wf_ahead: dict[str, np.ndarray] = {}
+        if self.replay_controller is not None:
+            ctrl = self.replay_controller
+            frac = ctrl._playhead - ctrl.current_index  # 0.0–1.0
+            if frac > 0 and ctrl.current_index < ctrl.packet_count:
+                for wf in ctrl.packets[ctrl.current_index].waveforms:
+                    ch = wf.channel_name
+                    n_ahead = int(frac * len(wf.samples))
+                    if ch not in _wf_ahead and n_ahead > 0 and wf.samples:
+                        _wf_ahead[ch] = np.array(
+                            wf.samples[:n_ahead], dtype=float)
 
         # -- Update waveforms --
-        for name, key in [("OxiA", "oxi_a"), ("OxiB", "oxi_b"),
-                          ("PAT", "pat"), ("Chest", "chest")]:
-            data = snap[key]
+        _ch_keys = [("OxiA", "oxi_a"), ("OxiB", "oxi_b"),
+                    ("PAT", "pat"), ("Chest", "chest")]
+        for name, key in _ch_keys:
+            buf_data = snap[key]
+            ahead = _wf_ahead.get(name)
+            if ahead is not None and len(ahead) > 0:
+                combined = np.concatenate([buf_data, ahead])
+                display_data = combined[-BUFFER_SIZE:]
+            else:
+                display_data = buf_data
             line = self.wave_lines[name]
             ax = self.wave_axes[name]
-            if len(data) > 0:
-                x = np.arange(len(data))
-                line.set_data(x, data)
-                ax.set_xlim(0, max(len(data), BUFFER_SIZE))
-                lo, hi = np.min(data), np.max(data)
-                margin = max((hi - lo) * 0.1, 1)
-                ax.set_ylim(lo - margin, hi + margin)
+            if len(display_data) > 0:
+                x_start = max(0, BUFFER_SIZE - len(display_data))
+                x = np.arange(x_start, x_start + len(display_data))
+                line.set_data(x, display_data)
+                ax.set_xlim(0, BUFFER_SIZE)
+                # Prefer the committed buffer for y-limits so future samples
+                # do not jerk the axis around at packet boundaries, but fall
+                # back to the visible data while the replay is still before the
+                # first fully committed packet.
+                ylim_source = buf_data if len(buf_data) > 0 else display_data
+                ax.set_ylim(*self._wave_ylim_for(name, ylim_source, snap["packet_count"]))
             else:
                 line.set_data([], [])
 
@@ -845,10 +1060,10 @@ class WatchPATDashboard:
         # -- Update SpO2 trend --
         spo2_data = snap["spo2_history"]
         if len(spo2_data) > 0:
-            x = np.arange(len(spo2_data))
-            self.spo2_trend_line.set_data(x, spo2_data)
+            x, spo2_valid = _valid_spo2_xy(np.arange(len(spo2_data)), spo2_data)
+            self.spo2_trend_line.set_data(x, spo2_valid)
             self.ax_spo2_trend.set_xlim(0, max(len(spo2_data), DERIVED_HISTORY))
-            valid = spo2_data[~np.isnan(spo2_data)]
+            valid = spo2_valid
             if len(valid) > 0:
                 lo, hi = float(np.min(valid)), float(np.max(valid))
                 margin = max((hi - lo) * 0.15, 1)
@@ -877,14 +1092,15 @@ class WatchPATDashboard:
         t_max_min = 1.0
         if len(spo2_times) > 0:
             t_min = spo2_times / 60.0
+            t_min_valid, spo2_valid = _valid_spo2_xy(t_min, spo2_full)
             t_max_min = max(float(t_min[-1]), 1.0)
             if overview_total_min is not None:
                 t_max_min = max(float(overview_total_min), 1.0)
             t_min_smooth, spo2_smooth = _smooth_and_downsample(
-                t_min, spo2_full, window=21, max_points=700)
+                t_min_valid, spo2_valid, window=21, max_points=700)
             self.spo2_full_line.set_data(t_min_smooth, spo2_smooth)
             self.ax_apnea.set_xlim(0, t_max_min)
-            valid_spo2 = spo2_full[~np.isnan(spo2_full)]
+            valid_spo2 = spo2_valid
             if len(valid_spo2) > 0:
                 lo = max(60.0, float(np.min(valid_spo2)) - 2)
                 self.ax_apnea.set_ylim(lo, 102)
@@ -899,13 +1115,15 @@ class WatchPATDashboard:
             self.ax_sleep_stage.set_xlim(0, t_max_min)
             labels = overview_snap["sleep_stage_labels"]
             stage_pixels = max(1, min(600, int(t_max_min * 2)))
-            rgba = np.zeros((1, stage_pixels, 4), dtype=float)
+            rgba = np.tile(SLEEP_STAGE_BG_RGBA, (1, stage_pixels, 1))
             stage_edges = np.linspace(0.0, t_max_min, stage_pixels + 1)
             labels = list(labels)
             for pixel in range(stage_pixels):
                 center = 0.5 * (stage_edges[pixel] + stage_edges[pixel + 1])
                 idx = np.searchsorted(stage_x, center, side="right") - 1
-                idx = max(0, min(idx, len(labels) - 1))
+                if idx < 0:
+                    continue
+                idx = min(idx, len(labels) - 1)
                 color = matplotlib.colors.to_rgba(
                     SLEEP_STAGE_COLORS.get(labels[idx], "#95a5a6"), alpha=1.0)
                 rgba[0, pixel, :] = color
@@ -914,7 +1132,7 @@ class WatchPATDashboard:
             self.stage_strip.set_xlim(0, t_max_min)
         else:
             self.sleep_stage_line.set_data([], [])
-            self.stage_strip_image.set_data(np.zeros((1, 1, 4)))
+            self.stage_strip_image.set_data(SLEEP_STAGE_BG_RGBA.reshape(1, 1, 4))
             self.stage_strip_image.set_extent([0, 1, 0, 1])
 
         self._reset_event_lines()

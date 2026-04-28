@@ -25,6 +25,7 @@ BUFFER_SIZE     = WINDOW_SECONDS * WAVEFORM_RATE   # 1000 samples
 MOTION_BUFFER   = WINDOW_SECONDS * MOTION_RATE     # 50 samples
 DERIVED_HISTORY = 120
 DERIVE_INTERVAL = 1.0
+LONG_HISTORY_SECONDS = 4 * 3600
 
 POSITION_LABELS = {
     "z+": "Supine",
@@ -243,8 +244,9 @@ def _compute_resp_features(samples: np.ndarray, rate: int) -> tuple[float, float
 class SensorBuffers:
     """Thread-safe rolling buffers for all sensor channels."""
 
-    def __init__(self):
+    def __init__(self, full_session_history: bool = False):
         self.lock = threading.Lock()
+        history_maxlen = None if full_session_history else LONG_HISTORY_SECONDS
 
         self.oxi_a = deque(maxlen=BUFFER_SIZE)
         self.oxi_b = deque(maxlen=BUFFER_SIZE)
@@ -266,16 +268,16 @@ class SensorBuffers:
         self._spo2_score_ba = 0.0
         self._spo2_raw = deque(maxlen=15)
         self._spo2_ema = -1.0
-        self.hr_full_history: deque = deque(maxlen=4 * 3600)
-        self.hr_full_times: deque = deque(maxlen=4 * 3600)
-        self.motion_level_history: deque = deque(maxlen=4 * 3600)
-        self.motion_level_times: deque = deque(maxlen=4 * 3600)
-        self.resp_rate_history: deque = deque(maxlen=4 * 3600)
-        self.resp_amp_history: deque = deque(maxlen=4 * 3600)
-        self.resp_variability_history: deque = deque(maxlen=4 * 3600)
-        self.sleep_stage_history: deque = deque(maxlen=4 * 3600)
-        self.sleep_stage_times: deque = deque(maxlen=4 * 3600)
-        self.sleep_stage_label_history: deque = deque(maxlen=4 * 3600)
+        self.hr_full_history: deque = deque(maxlen=history_maxlen)
+        self.hr_full_times: deque = deque(maxlen=history_maxlen)
+        self.motion_level_history: deque = deque(maxlen=history_maxlen)
+        self.motion_level_times: deque = deque(maxlen=history_maxlen)
+        self.resp_rate_history: deque = deque(maxlen=history_maxlen)
+        self.resp_amp_history: deque = deque(maxlen=history_maxlen)
+        self.resp_variability_history: deque = deque(maxlen=history_maxlen)
+        self.sleep_stage_history: deque = deque(maxlen=history_maxlen)
+        self.sleep_stage_times: deque = deque(maxlen=history_maxlen)
+        self.sleep_stage_label_history: deque = deque(maxlen=history_maxlen)
         self.current_sleep_stage = SLEEP_STAGE_AWAKE
 
         self.body_position = "?"
@@ -288,8 +290,8 @@ class SensorBuffers:
         self.last_motion_crc_total = 0
         self.events = deque(maxlen=20)
 
-        self.spo2_full_history: deque = deque(maxlen=4 * 3600)
-        self.spo2_full_times: deque = deque(maxlen=4 * 3600)
+        self.spo2_full_history: deque = deque(maxlen=history_maxlen)
+        self.spo2_full_times: deque = deque(maxlen=history_maxlen)
         self.apnea_events: list = []
         self.apnea_event_count = 0
         self.ahi_estimate = -1.0
@@ -298,8 +300,8 @@ class SensorBuffers:
         self._desat_start_elapsed = 0.0
         self._desat_nadir = 100.0
 
-        self.pat_amp_history: deque = deque(maxlen=4 * 3600)
-        self.pat_amp_times: deque = deque(maxlen=4 * 3600)
+        self.pat_amp_history: deque = deque(maxlen=history_maxlen)
+        self.pat_amp_times: deque = deque(maxlen=history_maxlen)
         self.pat_events: list = []
         self.pat_event_type_counts: Counter = Counter()
         self.pahi_estimate = -1.0
@@ -680,7 +682,10 @@ class SensorBuffers:
                 "PAT": self.pat, "Chest": self.chest}.get(name)
 
     def clone(self, compact: bool = False):
-        other = SensorBuffers()
+        preserve_full_history = (
+            self.hr_full_history.maxlen is None and not compact
+        )
+        other = SensorBuffers(full_session_history=preserve_full_history)
         with self.lock:
             recent_seconds = 600
             recent_stage = 120

@@ -9,11 +9,12 @@ import unittest
 from unittest import mock
 from queue import Queue
 
-import numpy as np
-
 # Keep matplotlib headless for CI and local test runs.
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "watchpat-mpl"))
+
+import numpy as np
+from matplotlib.backend_bases import MouseEvent
 
 # Locate the project root so imports work regardless of cwd.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +55,22 @@ class TestWatchPATDashboard(unittest.TestCase):
         self.dashboard = watchpat_gui.WatchPATDashboard(self.buffers)
         self.addCleanup(watchpat_gui.plt.close, self.dashboard.fig)
 
+    def test_smooth_and_downsample_preserves_spo2_left_edge_level(self):
+        x = np.arange(30, dtype=float)
+        y = np.full(30, 92.0, dtype=float)
+
+        sx, sy = watchpat_gui._smooth_and_downsample(x, y, window=21, max_points=700)
+
+        self.assertEqual(len(sx), 30)
+        self.assertEqual(float(sy[0]), 92.0)
+        self.assertEqual(float(sy[-1]), 92.0)
+
+    def test_apply_window_icon_is_safe_without_window(self):
+        fig = mock.Mock()
+        fig.canvas = mock.Mock(manager=mock.Mock(window=None))
+
+        watchpat_gui._apply_window_icon(fig)
+
     def test_update_populates_dashboard_text_and_lines(self):
         artists = self.dashboard.update(frame=0)
 
@@ -66,6 +83,132 @@ class TestWatchPATDashboard(unittest.TestCase):
         self.assertEqual(len(self.dashboard.wave_lines["OxiA"].get_xdata()), 3)
         self.assertEqual(len(self.dashboard.accel_lines["x"].get_ydata()), 3)
         self.assertGreater(len(artists), 0)
+
+    def test_update_right_aligns_partial_waveforms_in_fixed_window(self):
+        self.dashboard.update(frame=0)
+
+        xdata = np.asarray(self.dashboard.wave_lines["OxiA"].get_xdata())
+        self.assertEqual(len(xdata), 3)
+        self.assertEqual(xdata[0], watchpat_gui.BUFFER_SIZE - 3)
+        self.assertEqual(xdata[-1], watchpat_gui.BUFFER_SIZE - 1)
+        self.assertEqual(self.dashboard.wave_axes["OxiA"].get_xlim(), (0.0, float(watchpat_gui.BUFFER_SIZE)))
+
+    def test_update_keeps_partial_waveform_ylim_stable_across_small_changes(self):
+        self.dashboard.update(frame=0)
+        initial_ylim = self.dashboard.wave_axes["OxiA"].get_ylim()
+
+        with self.buffers.lock:
+            self.buffers.oxi_a.extend([4307, 4308, 4309])
+
+        self.dashboard.update(frame=1)
+
+        self.assertEqual(self.dashboard.wave_axes["OxiA"].get_ylim(), initial_ylim)
+
+    def test_update_throttles_waveform_ylim_shrink_across_packets(self):
+        with self.buffers.lock:
+            self.buffers.oxi_a.clear()
+            self.buffers.oxi_a.extend([0, 100])
+            self.buffers.packet_count = 1
+
+        self.dashboard.update(frame=0)
+        initial_ylim = self.dashboard.wave_axes["OxiA"].get_ylim()
+
+        with self.buffers.lock:
+            self.buffers.oxi_a.clear()
+            self.buffers.oxi_a.extend([40, 60])
+            self.buffers.packet_count = 2
+
+        self.dashboard.update(frame=1)
+
+        self.assertEqual(self.dashboard.wave_axes["OxiA"].get_ylim(), initial_ylim)
+
+    def test_update_blends_ahead_samples_before_waveform_buffer_is_full(self):
+        controller = mock.Mock()
+        controller.buffers = self.buffers
+        controller.full_buffers = self.buffers
+        controller.current_index = 0
+        controller.packet_count = 1
+        controller.paused = False
+        controller.speed = 1.0
+        controller._playhead = 0.5
+        controller.advance = mock.Mock(return_value=self.buffers)
+        controller.packets = [
+            mock.Mock(
+                waveforms=[
+                    mock.Mock(
+                        channel_name="OxiA",
+                        samples=list(range(100, 200)),
+                    )
+                ]
+            )
+        ]
+
+        self.dashboard.replay_controller = controller
+        self.dashboard.update(frame=0)
+
+        ydata = np.asarray(self.dashboard.wave_lines["OxiA"].get_ydata())
+        self.assertEqual(len(ydata), 53)
+        np.testing.assert_array_equal(ydata[-50:], np.arange(100, 150))
+
+    def test_update_handles_ahead_samples_before_first_packet_is_committed(self):
+        empty_buffers = watchpat_gui.SensorBuffers()
+        dashboard = watchpat_gui.WatchPATDashboard(empty_buffers)
+        self.addCleanup(watchpat_gui.plt.close, dashboard.fig)
+
+        controller = mock.Mock()
+        controller.buffers = empty_buffers
+        controller.full_buffers = empty_buffers
+        controller.current_index = 0
+        controller.packet_count = 1
+        controller.paused = False
+        controller.speed = 1.0
+        controller._playhead = 0.25
+        controller.advance = mock.Mock(return_value=empty_buffers)
+        controller.packets = [
+            mock.Mock(
+                waveforms=[
+                    mock.Mock(
+                        channel_name="OxiA",
+                        samples=list(range(200, 300)),
+                    )
+                ]
+            )
+        ]
+
+        dashboard.replay_controller = controller
+        dashboard.update(frame=0)
+
+        ydata = np.asarray(dashboard.wave_lines["OxiA"].get_ydata())
+        self.assertEqual(len(ydata), 25)
+        np.testing.assert_array_equal(ydata, np.arange(200, 225))
+
+    def test_update_scales_pat_lookahead_to_actual_packet_length(self):
+        controller = mock.Mock()
+        controller.buffers = self.buffers
+        controller.full_buffers = self.buffers
+        controller.current_index = 0
+        controller.packet_count = 1
+        controller.paused = False
+        controller.speed = 1.0
+        controller._playhead = 0.5
+        controller.advance = mock.Mock(return_value=self.buffers)
+        controller.packets = [
+            mock.Mock(
+                waveforms=[
+                    mock.Mock(
+                        channel_name="PAT",
+                        samples=list(range(300, 407)),
+                    )
+                ]
+            )
+        ]
+
+        self.dashboard.replay_controller = controller
+        self.dashboard.update(frame=0)
+
+        ydata = np.asarray(self.dashboard.wave_lines["PAT"].get_ydata())
+        self.assertEqual(len(ydata), 56)
+        np.testing.assert_array_equal(ydata[-53:], np.arange(300, 353))
 
     def test_update_renders_pahi_prdi_counts_and_central_stats(self):
         now = time.time()
@@ -119,6 +262,38 @@ class TestWatchPATDashboard(unittest.TestCase):
         self.assertIn("SpO2 line", legend_texts)
         self.assertIn("Gray bars = respiratory events / 5 min", legend_texts)
         self.assertIn("Stages:", legend_texts)
+        strip = np.asarray(self.dashboard.stage_strip_image.get_array())
+        np.testing.assert_array_equal(strip[0, 0], watchpat_gui.SLEEP_STAGE_BG_RGBA)
+
+    def test_update_keeps_empty_stage_strip_background_black(self):
+        with self.buffers.lock:
+            self.buffers.sleep_stage_times.clear()
+            self.buffers.sleep_stage_history.clear()
+            self.buffers.sleep_stage_label_history.clear()
+
+        self.dashboard.update(frame=0)
+
+        np.testing.assert_array_equal(
+            self.dashboard.stage_strip_image.get_array(),
+            watchpat_gui.SLEEP_STAGE_BG_RGBA.reshape(1, 1, 4),
+        )
+
+    def test_update_ignores_invalid_startup_spo2_zero(self):
+        with self.buffers.lock:
+            self.buffers.spo2_history.clear()
+            self.buffers.spo2_history.extend([0.0, 92.0, 93.0])
+            self.buffers.spo2_full_times.clear()
+            self.buffers.spo2_full_history.clear()
+            self.buffers.spo2_full_times.extend([60.0, 120.0, 180.0])
+            self.buffers.spo2_full_history.extend([0.0, 92.0, 93.0])
+
+        self.dashboard.update(frame=0)
+
+        trend_y = np.asarray(self.dashboard.spo2_trend_line.get_ydata())
+        full_y = np.asarray(self.dashboard.spo2_full_line.get_ydata())
+        self.assertTrue(np.all(trend_y > 0))
+        self.assertTrue(np.all(full_y > 0))
+        self.assertEqual(float(full_y[0]), 92.0)
 
     def test_update_smooths_long_apnea_panel_traces(self):
         with self.buffers.lock:
@@ -163,14 +338,58 @@ class TestWatchPATDashboard(unittest.TestCase):
         controller.packet_count = 10
         controller.paused = True
         controller.speed = 1.0
+        controller._playhead = 3.0
         controller.seek = mock.Mock(return_value=controller.buffers)
         controller.advance = mock.Mock(return_value=controller.buffers)
 
         self.dashboard.enable_replay_scrubber(controller)
-        self.dashboard.replay_slider.set_val(5)
+        event = MouseEvent(
+            "button_press_event",
+            self.dashboard.fig.canvas,
+            x=0,
+            y=0,
+            button=1,
+        )
+        event.inaxes = self.dashboard.ax_apnea
+        event.xdata = 5.0 / 60.0
+        self.dashboard.fig.canvas.callbacks.process("button_press_event", event)
 
         controller.seek.assert_called_with(5)
         self.assertIs(self.dashboard.buffers, controller.buffers)
+
+    def test_replay_scrubber_seek_resets_waveform_ylim_cache(self):
+        controller = mock.Mock()
+        controller.buffers = watchpat_gui.SensorBuffers()
+        controller.full_buffers = watchpat_gui.SensorBuffers()
+        controller.current_index = 3
+        controller.packet_count = 10
+        controller.paused = True
+        controller.speed = 1.0
+        controller._playhead = 3.0
+        controller.seek = mock.Mock(return_value=controller.buffers)
+        controller.advance = mock.Mock(return_value=controller.buffers)
+
+        self.dashboard._wave_y_limits["OxiA"] = (0.0, 1.0)
+        self.dashboard._wave_y_history["OxiA"] = watchpat_gui.deque([(0.0, 1.0)])
+        self.dashboard._wave_y_last_packet["OxiA"] = 99
+        self.dashboard._wave_y_last_update_packet["OxiA"] = 99
+
+        self.dashboard.enable_replay_scrubber(controller)
+        event = MouseEvent(
+            "button_press_event",
+            self.dashboard.fig.canvas,
+            x=0,
+            y=0,
+            button=1,
+        )
+        event.inaxes = self.dashboard.ax_apnea
+        event.xdata = 5.0 / 60.0
+        self.dashboard.fig.canvas.callbacks.process("button_press_event", event)
+
+        self.assertEqual(self.dashboard._wave_y_limits, {})
+        self.assertEqual(self.dashboard._wave_y_history, {})
+        self.assertEqual(self.dashboard._wave_y_last_packet, {})
+        self.assertEqual(self.dashboard._wave_y_last_update_packet, {})
 
     def test_replay_update_advances_controller_and_syncs_slider(self):
         controller = mock.Mock()
@@ -180,19 +399,18 @@ class TestWatchPATDashboard(unittest.TestCase):
         controller.packet_count = 12
         controller.paused = False
         controller.speed = 2.0
+        controller._playhead = 4.0
         controller.advance = mock.Mock(return_value=self.buffers)
 
         self.dashboard.enable_replay_scrubber(controller)
         artists = self.dashboard.update(frame=0)
 
         controller.advance.assert_called_once()
-        self.assertEqual(self.dashboard.replay_slider.val, 4)
         self.assertGreater(len(artists), 0)
         self.assertIn("Elapsed:      0m 04s", self.dashboard.stats_text.get_text())
-        self.assertLess(
-            self.dashboard.replay_slider.ax.get_position().y1,
-            self.dashboard.ax_apnea.get_position().y0,
-        )
+        self.assertIsNotNone(self.dashboard.replay_status_text)
+        self.assertIn("4/12", self.dashboard.replay_status_text.get_text())
+        self.assertFalse(self.dashboard._replay_button_is_paused)
 
     def test_update_attaches_loaded_replay_controller(self):
         controller = mock.Mock()
@@ -202,6 +420,7 @@ class TestWatchPATDashboard(unittest.TestCase):
         controller.packet_count = 12
         controller.paused = True
         controller.speed = 1.0
+        controller._playhead = 0.0
         controller.advance = mock.Mock(return_value=self.buffers)
 
         replay_queue = Queue()
@@ -212,7 +431,22 @@ class TestWatchPATDashboard(unittest.TestCase):
 
         self.assertIs(self.dashboard.replay_controller, controller)
         self.assertEqual(self.dashboard.mode_text.get_text(), "Replay: ready")
-        self.assertIsNotNone(self.dashboard.replay_slider)
+        self.assertIsNotNone(self.dashboard.replay_button)
+        self.assertIsNotNone(self.dashboard.replay_status_text)
+
+    def test_replay_button_uses_play_pause_icons(self):
+        controller = mock.Mock()
+        controller.buffers = watchpat_gui.SensorBuffers()
+        controller.full_buffers = watchpat_gui.SensorBuffers()
+        controller.current_index = 0
+        controller.packet_count = 10
+        controller.paused = True
+        controller.speed = 1.0
+        controller.seek = mock.Mock(return_value=controller.buffers)
+        controller.advance = mock.Mock(return_value=controller.buffers)
+
+        self.dashboard.enable_replay_scrubber(controller)
+        self.assertTrue(self.dashboard._replay_button_is_paused)
 
     def test_event_markers_reset_when_scrubbing_backwards(self):
         with self.buffers.lock:
@@ -286,6 +520,20 @@ class TestBleFeeder(unittest.TestCase):
 
 
 class TestReplayController(unittest.TestCase):
+    def test_replay_full_buffers_keep_entire_session_history(self):
+        packet = mock.Mock(raw_payload=b"a", waveforms=[], motion=None,
+                           metric=None, events=[])
+
+        with mock.patch.object(watchpat_gui, "read_dat_file", return_value=[b"a"]):
+            with mock.patch.object(watchpat_gui, "parse_data_packet",
+                                   return_value=packet):
+                ctrl = watchpat_gui.ReplayController(
+                    "capture.dat", speed=1.0, use_cache=False)
+
+        self.assertIsNone(ctrl.full_buffers.spo2_full_history.maxlen)
+        self.assertIsNone(ctrl.full_buffers.sleep_stage_times.maxlen)
+        self.assertEqual(ctrl.checkpoints[0].spo2_full_history.maxlen, 4 * 3600)
+
     def test_nocache_skips_cache_path(self):
         packet_a = mock.Mock(raw_payload=b"a", waveforms=[], motion=None,
                              metric=None, events=[])
@@ -308,7 +556,8 @@ class TestReplayController(unittest.TestCase):
         with mock.patch.object(watchpat_gui, "read_dat_file", return_value=[b"a", b"b"]):
             with mock.patch.object(watchpat_gui, "parse_data_packet",
                                    side_effect=[packet_a, packet_b]):
-                ctrl = watchpat_gui.ReplayController("capture.dat", speed=1.0)
+                ctrl = watchpat_gui.ReplayController(
+                    "capture.dat", speed=1.0, use_cache=False)
 
         ctrl.seek(1)
         self.assertEqual(ctrl.current_index, 1)
@@ -329,7 +578,8 @@ class TestReplayController(unittest.TestCase):
         with mock.patch.object(watchpat_gui, "read_dat_file", return_value=[b"a", b"b"]):
             with mock.patch.object(watchpat_gui, "parse_data_packet",
                                    side_effect=[packet_a, packet_b]):
-                ctrl = watchpat_gui.ReplayController("capture.dat", speed=2.0)
+                ctrl = watchpat_gui.ReplayController(
+                    "capture.dat", speed=2.0, use_cache=False)
 
         ctrl.advance(2.0)
         self.assertEqual(ctrl.current_index, 2)
