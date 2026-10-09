@@ -148,6 +148,8 @@ The GUI tests are headless and validate dashboard update/close behavior without 
 
 ## Protocol Overview
 
+[docs/payload-from-firmware.md](docs/payload-from-firmware.md) describes the data payload as the device firmware builds it, checked against `tests/testdata2.dat`. It differs from the tables below in several places and lists them.
+
 ### BLE Transport
 
 The device uses the Nordic UART Service (NUS). Packets have a 24-byte header:
